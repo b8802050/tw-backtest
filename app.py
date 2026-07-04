@@ -1,6 +1,7 @@
 # 台股/台指期 回測面板（單檔版，適合手機/雲端部署）
 # 只需這個 app.py + requirements.txt 兩個檔即可運行。
 from __future__ import annotations
+import itertools
 
 # --- backtester/instrument.py ---
 from dataclasses import dataclass, field
@@ -444,7 +445,7 @@ import pandas as pd
 class Strategy:
     def __init__(self, instrument: Instrument, lot_size: int = 1000, size_pct: float = 0.95,
                  contracts: int = 1, allow_short: Optional[bool] = None,
-                 stop_loss: float = 0.0, take_profit: float = 0.0):
+                 stop_loss: float = 0.0, take_profit: float = 0.0, trailing_stop: float = 0.0):
         self.instrument = instrument
         self.sym = instrument.symbol
         self.lot_size = lot_size
@@ -453,7 +454,10 @@ class Strategy:
         self.allow_short = instrument.is_future if allow_short is None else allow_short
         self.stop_loss = stop_loss        # 0=關閉，0.05=5%
         self.take_profit = take_profit
+        self.trailing_stop = trailing_stop  # 移動停損：從進場後最佳價回落此 % 出場
         self._lock_dir = 0
+        self._pos_sign = 0                # 目前部位方向，用來偵測新開倉
+        self._extreme = None              # 進場後的最高(多)/最低(空)價
 
     def prepare(self, data: Dict[str, pd.DataFrame]):
         pass
@@ -496,14 +500,31 @@ class Strategy:
         pos = portfolio.position(self.sym)
         cur = pos.qty
 
-        # 停損 / 停利
-        if cur != 0 and (self.stop_loss > 0 or self.take_profit > 0) and pos.avg_price > 0:
+        # 追蹤進場後的最佳價（移動停損用）
+        if cur != 0:
+            sgn = 1 if cur > 0 else -1
+            if sgn != self._pos_sign or self._extreme is None:
+                self._pos_sign, self._extreme = sgn, price
+            else:
+                self._extreme = max(self._extreme, price) if sgn > 0 else min(self._extreme, price)
+        else:
+            self._pos_sign, self._extreme = 0, None
+
+        # 停損 / 停利 / 移動停損
+        if cur != 0 and pos.avg_price > 0:
             ret = (price / pos.avg_price - 1.0) if cur > 0 else (pos.avg_price / price - 1.0)
             hit_sl = self.stop_loss > 0 and ret <= -self.stop_loss
             hit_tp = self.take_profit > 0 and ret >= self.take_profit
-            if hit_sl or hit_tp:
+            hit_tr = False
+            if self.trailing_stop > 0 and self._extreme:
+                if cur > 0 and price <= self._extreme * (1 - self.trailing_stop):
+                    hit_tr = True
+                elif cur < 0 and price >= self._extreme * (1 + self.trailing_stop):
+                    hit_tr = True
+            if hit_sl or hit_tp or hit_tr:
                 self._lock_dir = 1 if cur > 0 else -1
-                return [Order(self.instrument, -cur, "停損" if hit_sl else "停利")]
+                note = "停損" if hit_sl else ("停利" if hit_tp else "移動停損")
+                return [Order(self.instrument, -cur, note)]
 
         target = self.signal(ts, data, idx, portfolio)
         if target is None:
@@ -672,23 +693,23 @@ class FibonacciStrategy(Strategy):
 
 
 class CompositeStrategy(Strategy):
-    """複合策略：結合兩個子策略的訊號。AND=兩者一致才進場；OR=任一成立即進場（衝突則空手）。"""
-    def __init__(self, instrument, strat_a: Strategy, strat_b: Strategy, mode: str = "AND", **kw):
+    """複合策略：結合多個子策略。AND=全部一致才進場；OR=任一成立即進場（多空衝突則空手）。"""
+    def __init__(self, instrument, subs, mode: str = "AND", **kw):
         super().__init__(instrument, **kw)
-        self.a, self.b, self.mode = strat_a, strat_b, mode.upper()
+        self.subs = list(subs)
+        self.mode = mode.upper()
 
     def prepare(self, data):
-        self.a.prepare(data); self.b.prepare(data)
+        for s in self.subs:
+            s.prepare(data)
 
     def signal(self, ts, data, idx, portfolio):
-        a = self.a.signal(ts, data, idx, portfolio) or 0
-        b = self.b.signal(ts, data, idx, portfolio) or 0
+        sigs = [(s.signal(ts, data, idx, portfolio) or 0) for s in self.subs]
         if self.mode == "AND":
-            if a == 1 and b == 1: return 1
-            if a == -1 and b == -1: return -1
+            if all(x == 1 for x in sigs): return 1
+            if all(x == -1 for x in sigs): return -1
             return 0
-        # OR
-        long_, short_ = (a == 1 or b == 1), (a == -1 or b == -1)
+        long_, short_ = any(x == 1 for x in sigs), any(x == -1 for x in sigs)
         if long_ and short_: return 0
         if long_: return 1
         if short_: return -1
@@ -767,6 +788,9 @@ def compute_metrics(equity: pd.DataFrame, trades: pd.DataFrame,
             avg_win = wins.mean() if len(wins) else 0.0
             avg_loss = losses.mean() if len(losses) else 0.0
 
+    payoff = (avg_win / abs(avg_loss)) if avg_loss < 0 else (float("inf") if avg_win > 0 else 0.0)
+    expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss   # 每筆交易的期望損益
+
     return {
         "初始資金": initial_cash,
         "期末權益": float(eq.iloc[-1]),
@@ -780,8 +804,10 @@ def compute_metrics(equity: pd.DataFrame, trades: pd.DataFrame,
         "平倉次數": n_trades,
         "勝率": win_rate,
         "獲利因子": profit_factor,
+        "賺賠比": payoff,
         "平均獲利": avg_win,
         "平均虧損": avg_loss,
+        "每筆期望值": expectancy,
         "是否爆倉": ruined,
     }
 
@@ -790,7 +816,7 @@ def format_report(metrics: Dict[str, float]) -> str:
     if not metrics:
         return "（無資料）"
     pct = {"總報酬率", "年化報酬(CAGR)", "年化波動", "最大回撤(MDD)", "勝率"}
-    money = {"初始資金", "期末權益", "平均獲利", "平均虧損"}
+    money = {"初始資金", "期末權益", "平均獲利", "平均虧損", "每筆期望值"}
     lines = ["─" * 40, f"{'回測績效報告':^32}", "─" * 40]
     for k, v in metrics.items():
         if k == "是否爆倉":
@@ -905,12 +931,23 @@ COMMON = {
 INTRADAY = {"60分": "60m", "30分": "30m", "15分": "15m"}
 RESAMPLE = {"週K": "W", "月K": "ME"}
 SIMPLE_STRATS = [n for n in STRATEGY_REGISTRY if n != "買進持有"]
+# 參數最佳化的搜尋網格（刻意精簡，適合免費雲端）
+GRIDS = {
+    "均線交叉": {"fast": [5, 10, 20, 30], "slow": [40, 60, 120, 240]},
+    "通道突破": {"lookback": [10, 15, 20, 30, 40, 60]},
+    "RSI 超買超賣": {"period": [7, 14, 21], "oversold": [20, 25, 30, 35]},
+    "布林通道": {"period": [10, 20, 30], "k": [1.5, 2.0, 2.5]},
+    "MACD": {"fast": [8, 12, 16], "slow": [21, 26, 34]},
+    "KD 隨機指標": {"period": [5, 9, 14, 21]},
+    "黃金分割": {"lookback": [40, 60, 120], "buy_fib": [0.5, 0.618, 0.786]},
+}
+OBJECTIVES = {"總報酬率": "總報酬率", "Sharpe": "Sharpe", "勝率": "勝率", "最大回撤": "最大回撤"}
 
 
 @st.cache_data(show_spinner=False)
 def load_data(source, symbol, asset, start, end, token, interval_code, resample_rule,
               syn_periods, syn_s0, syn_sigma):
-    if interval_code:                                   # 分鐘K：僅 yfinance
+    if interval_code:
         df = YFinanceFeed().get(symbol, start=start, end=end, interval=interval_code)
     elif source == "FinMind":
         df = FinMindFeed(token=token or None).get(symbol, start=start, end=end, asset=asset)
@@ -930,13 +967,17 @@ def build_instrument(cfg):
     return tw_stock(cfg["symbol"], fee_discount=cfg["fee_discount"])
 
 
+def risk_kw(cfg):
+    return dict(lot_size=cfg["lot_size"], size_pct=cfg["size_pct"], contracts=cfg["contracts"],
+                stop_loss=cfg["stop_loss"], take_profit=cfg["take_profit"],
+                trailing_stop=cfg["trailing_stop"])
+
+
 def build_strategy(inst, cfg):
-    kw = dict(lot_size=cfg["lot_size"], size_pct=cfg["size_pct"], contracts=cfg["contracts"],
-              stop_loss=cfg["stop_loss"], take_profit=cfg["take_profit"])
+    kw = risk_kw(cfg)
     if cfg["strategy"] == "複合策略":
-        A = STRATEGY_REGISTRY[cfg["params"]["a"]](inst)
-        B = STRATEGY_REGISTRY[cfg["params"]["b"]](inst)
-        return CompositeStrategy(inst, A, B, mode=cfg["params"]["mode"], **kw)
+        subs = [STRATEGY_REGISTRY[nm](inst, **prm) for nm, prm in cfg["params"]["subs"]]
+        return CompositeStrategy(inst, subs, mode=cfg["params"]["mode"], **kw)
     return STRATEGY_REGISTRY[cfg["strategy"]](inst, **cfg["params"], **kw)
 
 
@@ -944,6 +985,29 @@ def run_engine(df, inst, strat, cfg):
     eng = Backtest([strat], {inst.symbol: df}, initial_cash=cfg["cash"],
                       broker=Broker(slippage=cfg["slippage"]))
     return eng.run(), eng
+
+
+def optimize(df, cfg, grid, objective):
+    keys = list(grid)
+    rows = []
+    for combo in itertools.product(*[grid[k] for k in keys]):
+        params = dict(zip(keys, combo))
+        inst = build_instrument(cfg)
+        strat = STRATEGY_REGISTRY[cfg["strategy"]](inst, **params, **risk_kw(cfg))
+        m, eng = run_engine(df, inst, strat, cfg)
+        rows.append({**params, "總報酬率": m["總報酬率"], "Sharpe": m["Sharpe"],
+                     "最大回撤": m["最大回撤(MDD)"], "勝率": m["勝率"],
+                     "獲利因子": m["獲利因子"], "平倉次數": int(m["平倉次數"])})
+    return pd.DataFrame(rows).sort_values(objective, ascending=False).reset_index(drop=True)
+
+
+def eval_row(df, cfg, params):
+    """用指定參數在某段資料上跑一次，回傳關鍵指標（供樣本外驗證）。"""
+    inst = build_instrument(cfg)
+    strat = STRATEGY_REGISTRY[cfg["strategy"]](inst, **params, **risk_kw(cfg))
+    m, _ = run_engine(df, inst, strat, cfg)
+    return {"總報酬率": m["總報酬率"], "Sharpe": m["Sharpe"], "最大回撤": m["最大回撤(MDD)"],
+            "勝率": m["勝率"], "獲利因子": m["獲利因子"]}
 
 
 def drawdown_series(equity):
@@ -957,27 +1021,67 @@ def secret_token():
         return ""
 
 
+def strategy_param_ui(name, kp=""):
+    def K(s): return f"{kp}_{s}" if kp else None
+    p = {}
+    if name == "均線交叉":
+        p["fast"] = st.slider("短均線", 3, 60, 20, key=K("fast"))
+        p["slow"] = st.slider("長均線", 10, 240, 60, key=K("slow"))
+    elif name == "通道突破":
+        p["lookback"] = st.slider("通道回看天數", 5, 120, 20, key=K("lb"))
+    elif name == "RSI 超買超賣":
+        p["period"] = st.slider("RSI 天數", 5, 30, 14, key=K("rp"))
+        p["oversold"] = st.slider("超賣門檻(買)", 10, 40, 30, key=K("os"))
+        p["overbought"] = st.slider("超買門檻(賣)", 60, 90, 70, key=K("ob"))
+    elif name == "布林通道":
+        p["period"] = st.slider("均線天數", 5, 60, 20, key=K("bp"))
+        p["k"] = st.slider("標準差倍數", 1.0, 3.0, 2.0, step=0.1, key=K("bk"))
+    elif name == "MACD":
+        p["fast"] = st.slider("快線 EMA", 5, 20, 12, key=K("mf"))
+        p["slow"] = st.slider("慢線 EMA", 20, 40, 26, key=K("ms"))
+        p["signal"] = st.slider("訊號線", 5, 15, 9, key=K("msig"))
+    elif name == "KD 隨機指標":
+        p["period"] = st.slider("KD 天數", 5, 30, 9, key=K("kp"))
+    elif name == "黃金分割":
+        p["lookback"] = st.slider("區間回看天數", 20, 240, 60, key=K("flb"))
+        fibs = [0.236, 0.382, 0.5, 0.618, 0.786]
+        p["buy_fib"] = st.select_slider("買進回檔位(較深)", fibs, value=0.618, key=K("fbuy"))
+        p["exit_fib"] = st.select_slider("出場回檔位(較淺)", fibs, value=0.382, key=K("fexit"))
+    return p
+
+
 st.set_page_config(page_title="台股/台指期 回測面板", page_icon="📈", layout="wide")
 st.markdown("""<style>
-[data-testid="stMetricValue"]{font-size:1.5rem;font-weight:700;}
-[data-testid="stMetricLabel"]{opacity:.75;}
-.block-container{padding-top:2.5rem;} h1{font-size:1.7rem;}
+.block-container{padding-top:2.2rem; max-width:1150px;}
+h1{font-size:1.7rem; letter-spacing:.5px;}
+[data-testid="stMetric"]{
+  background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.18);
+  border-radius:14px; padding:12px 16px;
+}
+[data-testid="stMetricValue"]{font-size:1.45rem; font-weight:700;}
+[data-testid="stMetricLabel"]{opacity:.7; font-size:.85rem;}
+[data-testid="stMetricDelta"]{font-size:.8rem;}
+section[data-testid="stSidebar"] div.stButton>button{border-radius:10px; font-weight:700; height:2.8rem;}
+div[data-testid="stExpander"]{border-radius:12px;}
+.stTabs [data-baseweb="tab"]{font-weight:600;}
 </style>""", unsafe_allow_html=True)
 st.title("📈 台股 / 台指期 回測")
 st.caption("選好條件 → 一鍵回測 → 看績效與走勢圖")
 
 with st.sidebar:
     st.header("⚙️ 控制面板")
+    mode = st.radio("模式", ["單次回測", "參數最佳化"], horizontal=True,
+                    help="單次回測=跑一組參數；參數最佳化=自動掃描多組參數找最佳")
     source = st.selectbox("資料來源", ["FinMind", "yfinance", "模擬資料"],
                           help="FinMind 免開戶免費、含真實台指期；分鐘K需選 yfinance")
     token = ""
     if source == "FinMind":
         token = st.text_input("FinMind token（選填）", type="password",
-                              help="留空 300 次/小時；填入 600 次/小時。雲端可改在 Secrets 設 FINMIND_TOKEN")
+                              help="留空 300 次/小時；填入 600；雲端可用 Secrets 設 FINMIND_TOKEN")
         token = token or secret_token()
 
     timeframe = st.selectbox("K線週期", ["日K", "週K", "月K", "60分", "30分", "15分"],
-                             help="日/週/月穩定；分鐘K僅 yfinance、且只能取近期")
+                             help="日/週/月穩定；分鐘K僅 yfinance、只能取近期")
     asset = "future" if st.radio("商品類型", ["股票", "期貨"], horizontal=True) == "期貨" else "stock"
 
     opts = COMMON[asset]
@@ -985,74 +1089,72 @@ with st.sidebar:
     pick = st.selectbox("標的", labels)
     symbol = st.text_input("輸入代碼", value="TX" if asset == "future" else "2330") if pick == "✏️ 自訂輸入" else dict(opts)[pick]
 
-    # 週期 → 抓取設定
     interval_code, resample_rule = None, None
     if timeframe in INTRADAY:
         if source == "yfinance":
             interval_code = INTRADAY[timeframe]
         else:
-            st.warning("分鐘K僅支援 yfinance 資料源，已改用日K。")
+            st.warning("分鐘K僅支援 yfinance，已改用日K。")
     elif timeframe in RESAMPLE:
         resample_rule = RESAMPLE[timeframe]
-
     if source == "yfinance":
         if asset == "future":
-            symbol = "^TWII"
-            st.caption("※ yfinance 無台指期連續合約，用加權指數 ^TWII 代理")
+            symbol = "^TWII"; st.caption("※ yfinance 無台指期連續合約，用加權指數 ^TWII 代理")
         elif "." not in symbol and not symbol.startswith("^"):
             symbol = symbol + ".TW"
 
     c1, c2 = st.columns(2)
     start = c1.date_input("起始日期", value=pd.Timestamp("2019-01-01")).strftime("%Y-%m-%d")
     end = c2.date_input("結束日期", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
-    if interval_code:   # 分鐘K：自動把起始日拉到可抓範圍
+    if interval_code:
         days = 55 if timeframe in ("15分", "30分") else 700
-        min_start = (pd.Timestamp.today() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-        if start < min_start:
-            start = min_start
-            st.caption(f"※ 分鐘K僅能取近期，起始日已調整為 {start}")
+        ms = (pd.Timestamp.today() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+        if start < ms:
+            start = ms; st.caption(f"※ 分鐘K僅能取近期，起始日已調整為 {start}")
 
     st.divider()
-    names = list(STRATEGY_REGISTRY.keys()) + ["複合策略"]
-    default_idx = names.index("通道突破") if asset == "future" else names.index("均線交叉")
-    strategy = st.selectbox("策略", names, index=default_idx)
+    cfg = {"asset": asset, "symbol": symbol}
+    objective = None
+    if mode == "參數最佳化":
+        cfg["strategy"] = st.selectbox("要最佳化的策略", list(GRIDS.keys()))
+        cfg["params"] = {}
+        objective = st.selectbox("最佳化目標", list(OBJECTIVES.keys()),
+                                 help="會依此指標排序找出最佳參數（含勝率）")
+        use_oos = st.checkbox("加入樣本外驗證", value=True,
+                              help="用前 70% 資料找最佳參數，再用後 30% 沒看過的資料檢驗，避免過度最佳化")
+        g = GRIDS[cfg["strategy"]]
+        n_combo = 1
+        for v in g.values():
+            n_combo *= len(v)
+        st.caption("搜尋範圍： " + "；".join(f"{k}={v}" for k, v in g.items()) + f"（共 {n_combo} 組）")
+    else:
+        names = list(STRATEGY_REGISTRY.keys()) + ["複合策略"]
+        cfg["strategy"] = st.selectbox("策略", names,
+                                       index=names.index("通道突破") if asset == "future" else names.index("均線交叉"))
+        p = {}
+        if cfg["strategy"] == "複合策略":
+            n = st.radio("子策略數量", [2, 3], horizontal=True)
+            defaults = ["均線交叉", "MACD", "KD 隨機指標"]
+            subs = []
+            for j in range(n):
+                nm = st.selectbox(f"策略 {chr(65+j)}", SIMPLE_STRATS,
+                                  index=SIMPLE_STRATS.index(defaults[j]), key=f"comp_sel_{j}")
+                st.caption(f"↳ {chr(65+j)}（{nm}）參數")
+                subs.append((nm, strategy_param_ui(nm, kp=f"c{j}")))
+            p["subs"] = subs
+            p["mode"] = "AND" if "AND" in st.radio("組合方式", ["兩者都成立(AND)", "任一成立(OR)"]) else "OR"
+        elif cfg["strategy"] == "買進持有":
+            st.caption("買進後抱到底，作為比較基準。")
+        else:
+            p = strategy_param_ui(cfg["strategy"])
+        cfg["params"] = p
 
-    p = {}
-    if strategy == "均線交叉":
-        p["fast"] = st.slider("短均線", 3, 60, 20); p["slow"] = st.slider("長均線", 10, 240, 60)
-    elif strategy == "通道突破":
-        p["lookback"] = st.slider("通道回看天數", 5, 120, 20)
-    elif strategy == "RSI 超買超賣":
-        p["period"] = st.slider("RSI 天數", 5, 30, 14)
-        p["oversold"] = st.slider("超賣門檻(買)", 10, 40, 30)
-        p["overbought"] = st.slider("超買門檻(賣)", 60, 90, 70)
-    elif strategy == "布林通道":
-        p["period"] = st.slider("均線天數", 5, 60, 20); p["k"] = st.slider("標準差倍數", 1.0, 3.0, 2.0, step=0.1)
-    elif strategy == "MACD":
-        p["fast"] = st.slider("快線 EMA", 5, 20, 12); p["slow"] = st.slider("慢線 EMA", 20, 40, 26)
-        p["signal"] = st.slider("訊號線", 5, 15, 9)
-    elif strategy == "KD 隨機指標":
-        p["period"] = st.slider("KD 天數", 5, 30, 9)
-    elif strategy == "黃金分割":
-        p["lookback"] = st.slider("區間回看天數", 20, 240, 60)
-        fibs = [0.236, 0.382, 0.5, 0.618, 0.786]
-        p["buy_fib"] = st.select_slider("買進回檔位(較深)", fibs, value=0.618)
-        p["exit_fib"] = st.select_slider("出場回檔位(較淺)", fibs, value=0.382)
-    elif strategy == "買進持有":
-        st.caption("買進後抱到底，作為比較基準。")
-    elif strategy == "複合策略":
-        p["a"] = st.selectbox("策略 A", SIMPLE_STRATS, index=SIMPLE_STRATS.index("均線交叉"))
-        p["b"] = st.selectbox("策略 B", SIMPLE_STRATS, index=SIMPLE_STRATS.index("MACD"))
-        p["mode"] = "AND" if "AND" in st.radio("組合方式", ["兩者都成立(AND)", "任一成立(OR)"],
-                                                help="AND 較嚴格、訊號較少；OR 較寬鬆") else "OR"
+    with st.expander("🛑 停損 / 停利 / 移動停損（選用）"):
+        sl = st.slider("停損 %", 0, 50, 0, help="跌破進場價這個 % 就出場（0=關閉）")
+        tp = st.slider("停利 %", 0, 100, 0, help="獲利達這個 % 就出場（0=關閉）")
+        tr = st.slider("移動停損 %", 0, 50, 0, help="從進場後最佳價回落這個 % 就出場（0=關閉）")
+    cfg["stop_loss"], cfg["take_profit"], cfg["trailing_stop"] = sl/100.0, tp/100.0, tr/100.0
 
-    with st.expander("🛑 停損 / 停利（選用）"):
-        sl = st.slider("停損 %", 0, 50, 0, help="0 = 關閉。跌破進場價這個 % 就出場")
-        tp = st.slider("停利 %", 0, 100, 0, help="0 = 關閉。獲利達這個 % 就出場")
-
-    st.divider()
-    cfg = {"asset": asset, "symbol": symbol, "strategy": strategy, "params": p,
-           "stop_loss": sl / 100.0, "take_profit": tp / 100.0}
     if asset == "future":
         cfg["contracts"] = st.number_input("交易口數", 1, 50, 1); cfg["lot_size"], cfg["size_pct"] = 1000, 0.95
     else:
@@ -1065,18 +1167,28 @@ with st.sidebar:
     cfg["syn_periods"], cfg["syn_s0"] = 1000, (18000.0 if asset == "future" else 600.0)
     cfg["syn_sigma"] = 0.18 if asset == "future" else 0.28
 
-    run = st.button("🚀 執行回測", type="primary", use_container_width=True)
+    run = st.button("🔧 開始最佳化" if mode == "參數最佳化" else "🚀 執行回測",
+                    type="primary", use_container_width=True)
 
 
 if not run:
     st.subheader("三步驟開始")
-    s1, s2, s3 = st.columns(3)
-    s1.markdown("### 1️⃣\n**打開左側控制面板**\n\n手機請點左上角 **»**")
-    s2.markdown("### 2️⃣\n**選條件**\n\n週期、商品、策略、停損停利")
-    s3.markdown("### 3️⃣\n**按 🚀 執行回測**\n\n馬上看到結果")
-    st.divider()
-    st.markdown("結果分三個分頁：**績效**、**走勢圖**（價格＋買賣點、與買進持有比較）、**成交明細**。")
-    st.info("💡 新手建議：資料 **FinMind**、週期 **日K**、商品 **股票**、標的 **台積電 2330**，直接按執行。")
+    cols = st.columns(3)
+    steps = [("1️⃣", "打開左側控制面板", "手機請點左上角 »"),
+             ("2️⃣", "選模式與條件", "單次回測 或 參數最佳化"),
+             ("3️⃣", "按下執行", "馬上看到結果")]
+    for col, (n, t, d) in zip(cols, steps):
+        with col.container(border=True):
+            st.markdown(f"### {n}"); st.markdown(f"**{t}**"); st.caption(d)
+    st.markdown("")
+    a, b = st.columns(2)
+    with a.container(border=True):
+        st.markdown("**📊 單次回測**")
+        st.caption("績效卡＋走勢圖(買賣點、與買進持有比較)＋成交明細")
+    with b.container(border=True):
+        st.markdown("**🔧 參數最佳化**")
+        st.caption("自動掃描多組參數，含樣本外驗證，依目標(含勝率)排序找最佳")
+    st.info("💡 新手建議：資料 **FinMind**、週期 **日K**、商品 **股票**、標的 **台積電 2330**。")
     st.stop()
 
 
@@ -1085,13 +1197,87 @@ try:
         df = load_data(source, symbol, asset, start, end, token, interval_code, resample_rule,
                        cfg["syn_periods"], cfg["syn_s0"], cfg["syn_sigma"])
 except Exception as e:
-    st.error(f"資料取得失敗（{type(e).__name__}）：{e}\n\n分鐘K請確認用 yfinance 且日期在近期；無外網請改「模擬資料」。")
+    st.error(f"資料取得失敗（{type(e).__name__}）：{e}\n\n分鐘K請用 yfinance 且日期在近期；無外網請改「模擬資料」。")
     st.stop()
-
 if df is None or df.empty or len(df) < 20:
-    st.warning("資料筆數不足（可能是週期太長或分鐘K範圍太短），請調整。")
+    st.warning("資料筆數不足（週期太長或分鐘K範圍太短），請調整。")
     st.stop()
 
+
+def pct(x): return f"{x*100:,.2f}%"
+
+# ---------- 參數最佳化 ----------
+if mode == "參數最佳化":
+    grid = GRIDS[cfg["strategy"]]; keys = list(grid)
+    split = use_oos and len(df) >= 80
+    if split:
+        n = int(len(df) * 0.7); train, test = df.iloc[:n], df.iloc[n:]
+    else:
+        train, test = df, None
+    with st.spinner("掃描參數中…"):
+        res = optimize(train, cfg, grid, objective)
+    best = res.iloc[0]
+
+    def fmt_obj(v):
+        return pct(v) if objective in ("總報酬率", "勝率", "最大回撤") else f"{v:.2f}"
+
+    def castp(k, v):
+        return int(v) if isinstance(grid[k][0], int) else round(float(v), 3)
+
+    st.success(f"完成：{cfg['strategy']}｜{symbol}｜{timeframe}｜掃描 {len(res)} 組參數"
+               + ("（前 70% 找參數）" if split else ""))
+    bstr = "、".join(f"{k}={castp(k, best[k])}" for k in keys)
+    st.markdown(f"🏆 **最佳參數（以{objective}）**：{bstr} ｜ {objective} = {fmt_obj(best[objective])}"
+                f" ｜ 獲利因子 {best['獲利因子']:.2f} ｜ 勝率 {pct(best['勝率'])}")
+
+    if test is not None:
+        rows = []
+        for _, row in res.head(8).iterrows():
+            params = {k: castp(k, row[k]) for k in keys}
+            ev = eval_row(test, cfg, params)
+            rows.append({**params,
+                         f"樣本內{objective}": row[objective],
+                         f"樣本外{objective}": ev[objective],
+                         "樣本外總報酬": ev["總報酬率"], "樣本外勝率": ev["勝率"],
+                         "樣本外獲利因子": ev["獲利因子"]})
+        oos = pd.DataFrame(rows)
+        st.markdown("#### 穩健度檢驗（前段找參數 → 後段驗證）")
+        st.caption("挑「樣本外」也表現好的那組，而不是只看樣本內冠軍；兩段落差很大＝可能過度最佳化。")
+        disp = oos.copy()
+        for c in oos.columns:
+            if c in keys:
+                continue
+            is_pct = ("報酬" in c) or ("勝率" in c) or (objective in c and objective in ("總報酬率", "勝率", "最大回撤"))
+            disp[c] = (oos[c] * 100).round(1).astype(str) + "%" if is_pct else oos[c].round(2)
+        st.dataframe(disp, use_container_width=True, height=320)
+
+    with st.expander("完整掃描結果" + ("（樣本內）" if split else "")):
+        full = res.copy()
+        for c in ["總報酬率", "最大回撤", "勝率"]:
+            full[c] = (full[c] * 100).round(2).astype(str) + "%"
+        full["Sharpe"] = full["Sharpe"].round(2); full["獲利因子"] = full["獲利因子"].round(2)
+        st.dataframe(full, use_container_width=True, height=300)
+
+    if len(keys) == 2:
+        try:
+            import altair as alt
+            x, y = keys
+            st.markdown(f"#### {objective} 熱力圖（樣本內，越亮越好）")
+            st.altair_chart(alt.Chart(res).mark_rect().encode(
+                x=alt.X(f"{x}:O", title=x), y=alt.Y(f"{y}:O", title=y),
+                color=alt.Color(f"{objective}:Q", scale=alt.Scale(scheme="viridis")),
+                tooltip=[x, y, alt.Tooltip(f"{objective}:Q", format=".3f")]), use_container_width=True)
+        except Exception:
+            pass
+
+    st.download_button("⬇️ 最佳化結果 CSV", res.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="optimize.csv", mime="text/csv")
+    st.warning("⚠️ 別只追高勝率或樣本內冠軍：勝率高不代表賺錢（可能賺小賠大，看**獲利因子/賺賠比**），"
+               "且樣本內最好常在樣本外變差。找到候選參數後，切「單次回測」看完整走勢圖再決定。")
+    st.stop()
+
+
+# ---------- 單次回測 ----------
 with st.spinner("回測運算中…"):
     inst = build_instrument(cfg)
     strat = build_strategy(inst, cfg)
@@ -1106,9 +1292,6 @@ with st.spinner("回測運算中…"):
 st.success(f"完成：{source}｜{symbol}｜{timeframe}｜{df.index.min().date()} ~ {df.index.max().date()}｜{len(df)} 根")
 tab1, tab2, tab3 = st.tabs(["📊 績效", "📈 走勢圖", "📋 成交明細"])
 
-
-def pct(x): return f"{x*100:,.2f}%"
-
 with tab1:
     m = metrics
     delta_ret = f"{(m['總報酬率']-bench['總報酬率'])*100:+.1f}% vs 買進持有" if bench else None
@@ -1118,8 +1301,17 @@ with tab1:
     r1[2].metric("Sharpe", f"{m['Sharpe']:.2f}")
     r1[3].metric("最大回撤", pct(m["最大回撤(MDD)"]))
     r2 = st.columns(4)
-    r2[0].metric("勝率", pct(m["勝率"])); r2[1].metric("獲利因子", f"{m['獲利因子']:.2f}")
-    r2[2].metric("平倉次數", f"{int(m['平倉次數'])}"); r2[3].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
+    r2[0].metric("勝率", pct(m["勝率"]))
+    r2[1].metric("獲利因子", f"{m['獲利因子']:.2f}")
+    pf = m["賺賠比"]
+    r2[2].metric("賺賠比", "∞" if pf == float("inf") else f"{pf:.2f}")
+    r2[3].metric("每筆期望值", f"{m['每筆期望值']:,.0f}")
+    r3 = st.columns(3)
+    r3[0].metric("平倉次數", f"{int(m['平倉次數'])}")
+    r3[1].metric("期末權益", f"{m['期末權益']:,.0f}")
+    r3[2].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
+    if m["勝率"] >= 0.55 and m["獲利因子"] < 1:
+        st.warning("⚠️ 勝率不低，但獲利因子 < 1（賺小賠大），整體其實是虧的——別只看勝率。")
     if bench:
         won = m["總報酬率"] > bench["總報酬率"]
         st.markdown(f"策略 **{pct(m['總報酬率'])}** ｜ 買進持有 **{pct(bench['總報酬率'])}** — "
@@ -1151,10 +1343,24 @@ with tab2:
         st.line_chart(df["close"], height=280); st.caption(f"(買賣點圖略過：{type(e).__name__})")
 
     st.markdown("**權益曲線 vs 買進持有**")
-    comp = pd.DataFrame({"策略": eng.equity_curve()["equity"]})
-    if bench is not None:
-        comp["買進持有"] = b_eng.equity_curve()["equity"]
-    st.line_chart(comp, height=280)
+    try:
+        import altair as alt
+        eqs = eng.equity_curve()["equity"].rename("策略").to_frame()
+        if bench is not None:
+            eqs["買進持有"] = b_eng.equity_curve()["equity"]
+        eqs = eqs.reset_index()
+        eqs = eqs.rename(columns={eqs.columns[0]: "日期"})
+        melt = eqs.melt("日期", var_name="項目", value_name="權益")
+        st.altair_chart(alt.Chart(melt).mark_line().encode(
+            x=alt.X("日期:T", title=None),
+            y=alt.Y("權益:Q", title="權益(NT$)", scale=alt.Scale(zero=False)),
+            color=alt.Color("項目:N", scale=alt.Scale(domain=["策略", "買進持有"], range=["#2563eb", "#94a3b8"]),
+                            legend=alt.Legend(title=None))).interactive(), use_container_width=True)
+    except Exception:
+        comp = pd.DataFrame({"策略": eng.equity_curve()["equity"]})
+        if bench is not None:
+            comp["買進持有"] = b_eng.equity_curve()["equity"]
+        st.line_chart(comp, height=280)
     st.markdown("**回撤**")
     st.area_chart(drawdown_series(eng.equity_curve()["equity"]), height=180, color="#c0392b")
 
