@@ -1,22 +1,8 @@
-"""台股/台指期 回測操作面板（單檔版，適合手機部署）。
-本檔已把整個 backtester 套件與 Streamlit 介面合併成一個檔案，
-雲端只需這個 app.py 加上 requirements.txt 兩個檔即可運行。"""
+# 台股/台指期 回測面板（單檔版，適合手機/雲端部署）
+# 只需這個 app.py + requirements.txt 兩個檔即可運行。
 from __future__ import annotations
 
-# ===== 來自 backtester/instrument.py =====
-"""
-金融商品規格 (Instrument specifications)
-
-定義「股票」與「期貨」兩種商品的交易成本、契約乘數、保證金等規則。
-所有預設值以台灣市場為主，可在建立物件時覆寫。
-
-設計重點：
-- equity_contribution(): 該部位對總權益的貢獻
-    * 股票  = 數量 * 現價            (買進時已支付名目價金，故用市值計算)
-    * 期貨  = (現價 - 進場價) * 乘數 * 口數   (僅佔保證金，故用未實現損益計算)
-- commission()/tax(): 單次成交的手續費與稅
-"""
-
+# --- backtester/instrument.py ---
 from dataclasses import dataclass, field
 
 
@@ -104,24 +90,7 @@ def mtx_future(symbol: str = "MTX", name: str = "小型台指(小台)") -> Instr
     return tx_future(symbol, name, multiplier=50.0, initial_margin=41750.0,
                      commission_per_contract=30.0)
 
-# ===== 來自 backtester/data.py =====
-"""
-資料來源 (Data feeds)
-
-提供統一的 OHLCV DataFrame (index=DatetimeIndex，欄位 open/high/low/close/volume)。
-
-- FinMindFeed：免開戶的免費開源資料，台股日線 + 真實台指期 (TX/MTX) 日線。
-- YFinanceFeed：真實資料，支援台股 (.TW / .TWO) 與加權指數 (^TWII)。
-  會自動把抓回的資料快取成 CSV，避免重複下載。
-- SyntheticFeed：用幾何布朗運動產生模擬資料，讓系統在無網路環境也能跑。
-- CsvFeed：讀取本地 CSV。
-
-台股代碼對照：
-  上市 (TWSE)  -> 數字 + .TW    例：台積電 2330.TW
-  上櫃 (TPEx)  -> 數字 + .TWO   例：3105.TWO
-  加權指數     -> ^TWII         (作為台指期標的代理)
-"""
-
+# --- backtester/data.py ---
 import os
 from typing import Optional
 import numpy as np
@@ -307,14 +276,7 @@ class FinMindFeed:
         df.to_csv(path)
         return df
 
-# ===== 來自 backtester/portfolio.py =====
-"""
-投資組合與部位 (Portfolio & Position)
-
-- Position：單一商品的數量(帶符號)與平均成本，並能套用一筆成交計算已實現損益。
-- Portfolio：現金、所有部位、權益曲線、成交紀錄、保證金使用量。
-"""
-
+# --- backtester/portfolio.py ---
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import pandas as pd
@@ -398,17 +360,7 @@ class Portfolio:
     def trades_df(self) -> pd.DataFrame:
         return pd.DataFrame(self.trades)
 
-# ===== 來自 backtester/broker.py =====
-"""
-撮合與下單 (Broker / Order)
-
-- Order：市價單，數量帶符號 (>0 買、<0 賣)。
-- Broker：依「下一根開盤價 + 滑價」成交，計算手續費/稅，更新 Portfolio。
-  期貨另檢查保證金是否足夠 (allow_margin_breach=False 時不足則拒單)。
-
-避免未來函數：策略在第 t 根收盤後送單，於第 t+1 根「開盤價」成交。
-"""
-
+# --- backtester/broker.py ---
 from dataclasses import dataclass
 from typing import Optional
 
@@ -474,21 +426,7 @@ class Broker:
                   f"fee={fee:.0f} tax={tax:.0f} realized={realized:.0f}")
         return True
 
-# ===== 來自 backtester/strategy.py =====
-"""
-策略 (Strategy)
-
-策略只負責「看資料、產生訂單」，不碰撮合與會計。
-
-介面：
-- prepare(data): 一次性計算指標 (可對整段序列計算；引擎只會在 on_bar 讀取
-  「當前 bar 以前」的值，因此不構成未來函數)。
-- on_bar(ts, data, idx, portfolio): 回傳 List[Order]，在「下一根開盤」成交。
-
-data : Dict[symbol -> DataFrame]
-idx  : Dict[symbol -> 該商品在當前 ts 的整數列位置 (iloc)，無資料則為 None]
-"""
-
+# --- backtester/strategy.py ---
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 import pandas as pd
@@ -585,13 +523,7 @@ class FuturesBreakoutStrategy(Strategy):
             orders.append(Order(self.instrument, -self.contracts - qty, "向下跌破做空"))
         return orders
 
-# ===== 來自 backtester/metrics.py =====
-"""
-績效指標 (Performance metrics)
-
-輸入權益曲線 (equity curve) 與成交紀錄，輸出常見回測指標。
-"""
-
+# --- backtester/metrics.py ---
 from typing import Dict
 import numpy as np
 import pandas as pd
@@ -686,18 +618,7 @@ def format_report(metrics: Dict[str, float]) -> str:
     lines.append("─" * 40)
     return "\n".join(lines)
 
-# ===== 來自 backtester/engine.py =====
-"""
-回測引擎 (Backtest engine)
-
-事件驅動逐根 bar 主迴圈，流程 (對齊所有商品的時間軸)：
-  對每一個時間點 ts：
-    1) 用「本根開盤價」撮合上一根產生的待成交訂單  -> 無未來函數
-    2) 用「本根收盤價」逐日結算 (mark-to-market)，記錄權益
-    3) 策略看「到本根收盤為止」的資料，產生下一批訂單
-最後一根產生的訂單不會成交 (沒有下一根)，符合實務。
-"""
-
+# --- backtester/engine.py ---
 from typing import Dict, List, Optional
 import pandas as pd
 
@@ -781,17 +702,7 @@ class Backtest:
     def trades(self) -> pd.DataFrame:
         return self.portfolio.trades_df()
 
-# ===== Streamlit 介面 (來自 app.py) =====
-"""
-回測操作面板 (Streamlit)
-
-啟動：
-    pip install -r requirements.txt
-    streamlit run app.py
-
-側邊欄選資料源／商品／策略／參數 -> 按「執行回測」-> 主畫面顯示績效、權益曲線、回撤、成交明細。
-所有運算都呼叫 backtester 套件的真實引擎；資料源支援 FinMind / yfinance / 模擬資料。
-"""
+# --- Streamlit 介面 ---
 
 import pandas as pd
 import streamlit as st
@@ -851,8 +762,8 @@ def secret_token() -> str:
 # ---------- UI ----------
 
 st.set_page_config(page_title="台股/台指期 回測面板", page_icon="📈", layout="wide")
-st.title("📈 台股 / 台指期 回測操作面板")
-st.caption("事件驅動引擎 · 真實資料源 (FinMind / yfinance) · 避免未來函數 · 期貨保證金與強制平倉")
+st.title("📈 台股 / 台指期 回測")
+st.caption("選好條件 → 一鍵回測 → 看績效與走勢圖")
 
 with st.sidebar:
     st.header("⚙️ 控制面板")
@@ -918,8 +829,14 @@ with st.sidebar:
 # ---------- 執行與結果 ----------
 
 if not run:
-    st.info("在左側設定條件後，點「執行回測」。\n\n"
-            "建議：做台指期回測選 **FinMind + 期貨 + TX**（免開戶、有真實近月連續日線）。")
+    st.subheader("三步驟開始")
+    s1, s2, s3 = st.columns(3)
+    s1.markdown("### 1️⃣\n**打開左側控制面板**\n\n手機請點左上角 **»**")
+    s2.markdown("### 2️⃣\n**選條件**\n\n資料來源、股票或期貨、策略")
+    s3.markdown("### 3️⃣\n**按 🚀 執行回測**\n\n馬上看到結果")
+    st.divider()
+    st.markdown("結果會顯示：**總報酬、Sharpe、最大回撤、勝率**，加上**權益曲線圖**與**成交明細**。")
+    st.info("💡 新手建議：資料來源選 **FinMind**、商品選 **股票**、代碼 **2330**，直接按執行試跑一次。")
     st.stop()
 
 try:
