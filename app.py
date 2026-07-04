@@ -211,10 +211,50 @@ def _finmind_select_front_month(df: pd.DataFrame, prefer_session: str = "positio
     return picked.drop(columns=["_ym", "_dym", "_rank"])
 
 
-def _finmind_futures_to_ohlcv(df: pd.DataFrame, prefer_session: str = "position") -> pd.DataFrame:
-    """TaiwanFuturesDaily -> 標準 OHLCV (近月連續)。欄位：open/max/min/close/volume。"""
+def _finmind_back_adjust(front: pd.DataFrame, raw: pd.DataFrame, prefer_session: str) -> pd.DataFrame:
+    """
+    回補式連續合約 (back-adjust / Panama)：消除換月跳空。
+    做法：換月當天，用「新合約在舊合約最後一天的收盤」與「舊合約收盤」的價差，
+    把該換月之前的所有價格平移，使序列在換月處連續（保留點數差 => 回測損益含轉倉）。
+    """
+    d = raw.copy()
+    if "trading_session" in d.columns:
+        reg = d[d["trading_session"].astype(str).str.lower() == prefer_session.lower()]
+        if not reg.empty:
+            d = reg
+    d = d[~d["contract_date"].astype(str).str.contains("/")]
+    close_lookup = {(str(r["date"]), str(r["contract_date"])): float(r["close"])
+                    for _, r in d.iterrows()}
+
+    f = front.sort_values("date").reset_index(drop=True)
+    cds = f["contract_date"].astype(str).tolist()
+    dates = f["date"].astype(str).tolist()
+    n = len(f)
+    offsets = [0.0] * n
+    cum = 0.0
+    for i in range(n - 1, 0, -1):
+        offsets[i] = cum
+        if cds[i] != cds[i - 1]:                       # i 為新合約首日，i-1 為舊合約末日
+            old_close = float(f["close"].iloc[i - 1])
+            new_close = close_lookup.get((dates[i - 1], cds[i]))  # 新合約在舊末日的收盤
+            if new_close is not None:
+                cum += (new_close - old_close)
+    offsets[0] = cum
+    off = pd.Series(offsets, index=f.index)
+    for c in ["open", "high", "low", "close"]:
+        if c in f.columns:
+            f[c] = f[c] + off
+    return f
+
+
+def _finmind_futures_to_ohlcv(df: pd.DataFrame, prefer_session: str = "position",
+                              backadjust: bool = True) -> pd.DataFrame:
+    """TaiwanFuturesDaily -> 標準 OHLCV。backadjust=True 產生回補式連續合約。"""
     picked = _finmind_select_front_month(df, prefer_session)
-    out = picked.rename(columns={"max": "high", "min": "low"}).set_index("date")
+    out = picked.rename(columns={"max": "high", "min": "low"})
+    if backadjust:
+        out = _finmind_back_adjust(out, df, prefer_session)
+    out = out.set_index("date")
     return _normalize(out)
 
 
@@ -232,10 +272,13 @@ class FinMindFeed:
     """
 
     def __init__(self, token: Optional[str] = None, cache_dir: str = ".cache",
-                 prefer_session: str = "position"):
+                 prefer_session: str = "position", adjusted: bool = True,
+                 backadjust: bool = True):
         self.token = token or os.getenv("FINMIND_TOKEN")
         self.cache_dir = cache_dir
         self.prefer_session = prefer_session
+        self.adjusted = adjusted        # 股票用還原股價（含息，避免除權息假跌）
+        self.backadjust = backadjust    # 期貨用回補式連續合約
         os.makedirs(cache_dir, exist_ok=True)
         self._dl = None
 
@@ -259,7 +302,8 @@ class FinMindFeed:
         end = end or ""
         is_fut = self._is_future(symbol, asset)
         kind = "fut" if is_fut else "stk"
-        path = os.path.join(self.cache_dir, f"finmind_{kind}_{symbol}_{start}_{end}.csv")
+        tag = ("adj" if self.adjusted else "raw") if not is_fut else ("ba" if self.backadjust else "cal")
+        path = os.path.join(self.cache_dir, f"finmind_{kind}_{tag}_{symbol}_{start}_{end}.csv")
         if use_cache and os.path.exists(path):
             return _normalize(pd.read_csv(path, index_col=0))
 
@@ -268,9 +312,10 @@ class FinMindFeed:
             raw = dl.taiwan_futures_daily(futures_id=symbol, start_date=start, end_date=end)
             if raw is None or raw.empty:
                 raise ValueError(f"FinMind 沒有抓到期貨 {symbol} 的資料。")
-            df = _finmind_futures_to_ohlcv(raw, self.prefer_session)
+            df = _finmind_futures_to_ohlcv(raw, self.prefer_session, backadjust=self.backadjust)
         else:
-            raw = dl.taiwan_stock_daily(stock_id=symbol, start_date=start, end_date=end)
+            fn = dl.taiwan_stock_daily_adj if self.adjusted else dl.taiwan_stock_daily
+            raw = fn(stock_id=symbol, start_date=start, end_date=end)
             if raw is None or raw.empty:
                 raise ValueError(f"FinMind 沒有抓到股票 {symbol} 的資料。")
             df = _finmind_stock_to_ohlcv(raw)
@@ -497,35 +542,7 @@ class Strategy:
         if i is None:
             return []
         price = float(data[self.sym]["close"].iloc[i])
-        pos = portfolio.position(self.sym)
-        cur = pos.qty
-
-        # 追蹤進場後的最佳價（移動停損用）
-        if cur != 0:
-            sgn = 1 if cur > 0 else -1
-            if sgn != self._pos_sign or self._extreme is None:
-                self._pos_sign, self._extreme = sgn, price
-            else:
-                self._extreme = max(self._extreme, price) if sgn > 0 else min(self._extreme, price)
-        else:
-            self._pos_sign, self._extreme = 0, None
-
-        # 停損 / 停利 / 移動停損
-        if cur != 0 and pos.avg_price > 0:
-            ret = (price / pos.avg_price - 1.0) if cur > 0 else (pos.avg_price / price - 1.0)
-            hit_sl = self.stop_loss > 0 and ret <= -self.stop_loss
-            hit_tp = self.take_profit > 0 and ret >= self.take_profit
-            hit_tr = False
-            if self.trailing_stop > 0 and self._extreme:
-                if cur > 0 and price <= self._extreme * (1 - self.trailing_stop):
-                    hit_tr = True
-                elif cur < 0 and price >= self._extreme * (1 + self.trailing_stop):
-                    hit_tr = True
-            if hit_sl or hit_tp or hit_tr:
-                self._lock_dir = 1 if cur > 0 else -1
-                note = "停損" if hit_sl else ("停利" if hit_tp else "移動停損")
-                return [Order(self.instrument, -cur, note)]
-
+        # 停損/停利/移動停損改由引擎以盤中高低價觸價處理（見 engine.py）。
         target = self.signal(ts, data, idx, portfolio)
         if target is None:
             return []
@@ -849,9 +866,63 @@ class Backtest:
         self.portfolio = Portfolio(initial_cash=initial_cash)
         self.maintenance_ratio = maintenance_ratio   # 維持保證金 / 原始保證金
         self.halted = False                           # 爆倉後停止交易
+        self._risk: Dict[str, dict] = {}              # sym -> {sign, peak} 進場後最佳價追蹤
         for st in strategies:
             self.portfolio.register(st.instrument)
         self._inst = {st.instrument.symbol: st.instrument for st in strategies}
+        self._strat_by_sym = {st.instrument.symbol: st for st in strategies}
+
+    def _apply_stops(self, ts, pos_map):
+        """盤中觸價停損/停利/移動停損：用本根 high/low 判斷是否觸價，並於同一根成交。"""
+        for sym, st in self._strat_by_sym.items():
+            if not (st.stop_loss > 0 or st.take_profit > 0 or st.trailing_stop > 0):
+                continue
+            i = pos_map[sym].get(ts)
+            if i is None:
+                continue
+            pos = self.portfolio.position(sym)
+            if pos.qty == 0:
+                self._risk[sym] = {"sign": 0, "peak": None}
+                continue
+            bar = self.data[sym].iloc[i]
+            o, hi, lo = float(bar["open"]), float(bar["high"]), float(bar["low"])
+            sgn = 1 if pos.qty > 0 else -1
+            r = self._risk.get(sym) or {"sign": 0, "peak": None}
+            if r["sign"] != sgn or r["peak"] is None:     # 新部位：從進場價起算最佳價
+                r = {"sign": sgn, "peak": pos.avg_price}
+            r["peak"] = max(r["peak"], hi) if sgn > 0 else min(r["peak"], lo)
+            self._risk[sym] = r
+            entry, peak = pos.avg_price, r["peak"]
+
+            fill, note = None, None
+            if sgn > 0:
+                sl = entry * (1 - st.stop_loss) if st.stop_loss > 0 else None
+                tr = peak * (1 - st.trailing_stop) if st.trailing_stop > 0 else None
+                stop_px = max([p for p in (sl, tr) if p is not None], default=None)
+                tp = entry * (1 + st.take_profit) if st.take_profit > 0 else None
+                if stop_px is not None and lo <= stop_px:        # 觸及停損（含移動）
+                    fill = o if o <= stop_px else stop_px        # 跳空開低則以開盤成交
+                    note = "移動停損" if (tr is not None and (sl is None or tr >= sl)) else "停損"
+                elif tp is not None and hi >= tp:                # 觸及停利
+                    fill = o if o >= tp else tp
+                    note = "停利"
+            else:
+                sl = entry * (1 + st.stop_loss) if st.stop_loss > 0 else None
+                tr = peak * (1 + st.trailing_stop) if st.trailing_stop > 0 else None
+                stop_px = min([p for p in (sl, tr) if p is not None], default=None)
+                tp = entry * (1 - st.take_profit) if st.take_profit > 0 else None
+                if stop_px is not None and hi >= stop_px:
+                    fill = o if o >= stop_px else stop_px
+                    note = "移動停損" if (tr is not None and (sl is None or tr <= sl)) else "停損"
+                elif tp is not None and lo <= tp:
+                    fill = o if o <= tp else tp
+                    note = "停利"
+
+            if fill is not None:
+                self.broker.execute(Order(self._inst[sym], -pos.qty, note), fill,
+                                    self.portfolio, ts, force=True)
+                st._lock_dir = sgn
+                self._risk[sym] = {"sign": 0, "peak": None}
 
     def _margin_call(self, prices: Dict[str, float], ts) -> bool:
         """權益跌破維持保證金或 <=0 -> 以收盤強制平倉所有部位。"""
@@ -887,6 +958,10 @@ class Backtest:
                 open_px = float(self.data[sym]["open"].iloc[i])
                 self.broker.execute(order, open_px, self.portfolio, ts)
             pending = still_pending
+
+            # 1b) 盤中觸價停損/停利/移動停損（同一根成交）
+            if not self.halted:
+                self._apply_stops(ts, pos_map)
 
             # 2) 以本根收盤逐日結算
             prices = {s: float(self.data[s]["close"].iloc[pos_map[s][ts]])
@@ -1002,12 +1077,37 @@ def optimize(df, cfg, grid, objective):
 
 
 def eval_row(df, cfg, params):
-    """用指定參數在某段資料上跑一次，回傳關鍵指標（供樣本外驗證）。"""
+    """用指定參數在某段資料上跑一次，回傳關鍵指標（供樣本外/滾動驗證）。"""
     inst = build_instrument(cfg)
     strat = STRATEGY_REGISTRY[cfg["strategy"]](inst, **params, **risk_kw(cfg))
     m, _ = run_engine(df, inst, strat, cfg)
     return {"總報酬率": m["總報酬率"], "Sharpe": m["Sharpe"], "最大回撤": m["最大回撤(MDD)"],
-            "勝率": m["勝率"], "獲利因子": m["獲利因子"]}
+            "勝率": m["勝率"], "獲利因子": m["獲利因子"], "平倉次數": int(m["平倉次數"])}
+
+
+def cast_params(grid, row):
+    return {k: (int(row[k]) if isinstance(grid[k][0], int) else round(float(row[k]), 3)) for k in grid}
+
+
+def walk_forward(df, cfg, grid, objective, n_folds=4):
+    """滾動式樣本外：擴張視窗找參數，在下一段沒看過的資料驗證，逐折累計。"""
+    N = len(df)
+    edges = [int(N * k / (n_folds + 1)) for k in range(n_folds + 2)]
+    rows = []
+    for i in range(n_folds):
+        tr, te = df.iloc[:edges[i + 1]], df.iloc[edges[i + 1]:edges[i + 2]]
+        if len(tr) < 40 or len(te) < 15:
+            continue
+        best = optimize(tr, cfg, grid, objective).iloc[0]
+        params = cast_params(grid, best)
+        ev = eval_row(te, cfg, params)
+        rows.append({"折": i + 1,
+                     "測試期": f"{te.index.min().date()} ~ {te.index.max().date()}",
+                     **params,
+                     "樣本外報酬": ev["總報酬率"], "樣本外勝率": ev["勝率"],
+                     "樣本外Sharpe": ev["Sharpe"], "樣本外獲利因子": ev["獲利因子"],
+                     "平倉次數": ev["平倉次數"]})
+    return pd.DataFrame(rows)
 
 
 def drawdown_series(equity):
@@ -1120,8 +1220,8 @@ with st.sidebar:
         cfg["params"] = {}
         objective = st.selectbox("最佳化目標", list(OBJECTIVES.keys()),
                                  help="會依此指標排序找出最佳參數（含勝率）")
-        use_oos = st.checkbox("加入樣本外驗證", value=True,
-                              help="用前 70% 資料找最佳參數，再用後 30% 沒看過的資料檢驗，避免過度最佳化")
+        validation = st.selectbox("驗證方式", ["單次切割（前70%找/後30%驗）", "Walk-forward 滾動驗證"],
+                                  help="Walk-forward 更嚴謹：分多段輪流『前段找參數→後段驗證』")
         g = GRIDS[cfg["strategy"]]
         n_combo = 1
         for v in g.values():
@@ -1209,7 +1309,40 @@ def pct(x): return f"{x*100:,.2f}%"
 # ---------- 參數最佳化 ----------
 if mode == "參數最佳化":
     grid = GRIDS[cfg["strategy"]]; keys = list(grid)
-    split = use_oos and len(df) >= 80
+    is_wf = validation.startswith("Walk")
+
+    def fmt_obj(v):
+        return pct(v) if objective in ("總報酬率", "勝率", "最大回撤") else f"{v:.2f}"
+
+    if is_wf:
+        with st.spinner("Walk-forward 滾動驗證中…"):
+            wf = walk_forward(df, cfg, grid, objective)
+        if wf.empty:
+            st.warning("資料太短，無法做滾動驗證。請拉長期間或改用單次切割。")
+            st.stop()
+        n_sets = wf[keys].drop_duplicates().shape[0]
+        st.success(f"完成：{cfg['strategy']}｜{symbol}｜{timeframe}｜Walk-forward 共 {len(wf)} 折")
+        c = st.columns(3)
+        c[0].metric("各折樣本外平均報酬", pct(wf["樣本外報酬"].mean()))
+        c[1].metric("各折樣本外平均勝率", pct(wf["樣本外勝率"].mean()))
+        c[2].metric("最佳參數穩定度", f"{n_sets}/{len(wf)} 組", help="不同折選到的參數種類，越少越穩定")
+        st.markdown("#### 各折結果（前段找參數 → 後段驗證）")
+        dwf = wf.copy()
+        for col in ["樣本外報酬", "樣本外勝率"]:
+            dwf[col] = (wf[col] * 100).round(1).astype(str) + "%"
+        for col in ["樣本外Sharpe", "樣本外獲利因子"]:
+            dwf[col] = wf[col].round(2)
+        st.dataframe(dwf, use_container_width=True, hide_index=True)
+        if n_sets > max(2, len(wf) // 2):
+            st.warning("⚠️ 各折選到的最佳參數很不一致 → 對參數敏感、穩健度低，別太相信單一組冠軍。")
+        if wf["平倉次數"].mean() < 30:
+            st.warning(f"⚠️ 每折平均僅約 {wf['平倉次數'].mean():.0f} 筆交易，樣本太少，統計上不可靠。")
+        st.download_button("⬇️ Walk-forward 結果 CSV", wf.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="walkforward.csv", mime="text/csv")
+        st.warning("⚠️ 即使 walk-forward 也不保證未來獲利，只是比單次切割更難自我欺騙；真實交易還有滑價、流動性與心理因素。")
+        st.stop()
+
+    split = len(df) >= 80
     if split:
         n = int(len(df) * 0.7); train, test = df.iloc[:n], df.iloc[n:]
     else:
@@ -1217,23 +1350,18 @@ if mode == "參數最佳化":
     with st.spinner("掃描參數中…"):
         res = optimize(train, cfg, grid, objective)
     best = res.iloc[0]
-
-    def fmt_obj(v):
-        return pct(v) if objective in ("總報酬率", "勝率", "最大回撤") else f"{v:.2f}"
-
-    def castp(k, v):
-        return int(v) if isinstance(grid[k][0], int) else round(float(v), 3)
-
     st.success(f"完成：{cfg['strategy']}｜{symbol}｜{timeframe}｜掃描 {len(res)} 組參數"
                + ("（前 70% 找參數）" if split else ""))
-    bstr = "、".join(f"{k}={castp(k, best[k])}" for k in keys)
+    bstr = "、".join(f"{k}={cast_params(grid, best)[k]}" for k in keys)
     st.markdown(f"🏆 **最佳參數（以{objective}）**：{bstr} ｜ {objective} = {fmt_obj(best[objective])}"
                 f" ｜ 獲利因子 {best['獲利因子']:.2f} ｜ 勝率 {pct(best['勝率'])}")
+    if best["平倉次數"] < 30:
+        st.warning(f"⚠️ 最佳這組只有 {int(best['平倉次數'])} 筆交易，樣本太少、統計不可靠，別當真。")
 
     if test is not None:
         rows = []
         for _, row in res.head(8).iterrows():
-            params = {k: castp(k, row[k]) for k in keys}
+            params = cast_params(grid, row)
             ev = eval_row(test, cfg, params)
             rows.append({**params,
                          f"樣本內{objective}": row[objective],
@@ -1272,8 +1400,8 @@ if mode == "參數最佳化":
 
     st.download_button("⬇️ 最佳化結果 CSV", res.to_csv(index=False).encode("utf-8-sig"),
                        file_name="optimize.csv", mime="text/csv")
-    st.warning("⚠️ 別只追高勝率或樣本內冠軍：勝率高不代表賺錢（可能賺小賠大，看**獲利因子/賺賠比**），"
-               "且樣本內最好常在樣本外變差。找到候選參數後，切「單次回測」看完整走勢圖再決定。")
+    st.warning("⚠️ 別只追高勝率或樣本內冠軍：勝率高不代表賺錢（看**獲利因子/賺賠比**），"
+               "且樣本內最好常在樣本外變差。更嚴謹請改用上方「Walk-forward 滾動驗證」。")
     st.stop()
 
 
@@ -1312,6 +1440,8 @@ with tab1:
     r3[2].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
     if m["勝率"] >= 0.55 and m["獲利因子"] < 1:
         st.warning("⚠️ 勝率不低，但獲利因子 < 1（賺小賠大），整體其實是虧的——別只看勝率。")
+    if 0 < m["平倉次數"] < 30:
+        st.info(f"ℹ️ 只有 {int(m['平倉次數'])} 筆交易，樣本偏少；勝率、Sharpe、獲利因子在 <30 筆下統計上不可靠，僅供參考。")
     if bench:
         won = m["總報酬率"] > bench["總報酬率"]
         st.markdown(f"策略 **{pct(m['總報酬率'])}** ｜ 買進持有 **{pct(bench['總報酬率'])}** — "
