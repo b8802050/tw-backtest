@@ -1,0 +1,979 @@
+"""台股/台指期 回測操作面板（單檔版，適合手機部署）。
+本檔已把整個 backtester 套件與 Streamlit 介面合併成一個檔案，
+雲端只需這個 app.py 加上 requirements.txt 兩個檔即可運行。"""
+from __future__ import annotations
+
+# ===== 來自 backtester/instrument.py =====
+"""
+金融商品規格 (Instrument specifications)
+
+定義「股票」與「期貨」兩種商品的交易成本、契約乘數、保證金等規則。
+所有預設值以台灣市場為主，可在建立物件時覆寫。
+
+設計重點：
+- equity_contribution(): 該部位對總權益的貢獻
+    * 股票  = 數量 * 現價            (買進時已支付名目價金，故用市值計算)
+    * 期貨  = (現價 - 進場價) * 乘數 * 口數   (僅佔保證金，故用未實現損益計算)
+- commission()/tax(): 單次成交的手續費與稅
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Instrument:
+    """商品基底類別。"""
+    symbol: str
+    name: str = ""
+    is_future: bool = False
+    multiplier: float = 1.0          # 契約乘數 (股票=1；大台=200)
+
+    # 交易成本
+    commission_rate: float = 0.0     # 依名目價金比例計收 (股票)
+    commission_per_contract: float = 0.0  # 每口固定手續費 (期貨)
+    min_commission: float = 0.0      # 最低手續費
+    tax_rate: float = 0.0            # 交易稅率
+    tax_on_sell_only: bool = True    # True=僅賣出課稅 (股票證交稅)；False=買賣皆課 (期交稅)
+
+    # 期貨專用
+    initial_margin: float = 0.0      # 每口原始保證金
+
+    def notional(self, price: float, qty: float) -> float:
+        """名目價金 = 價格 * |數量| * 乘數。"""
+        return abs(qty) * price * self.multiplier
+
+    def commission(self, price: float, qty: float) -> float:
+        if self.is_future:
+            fee = abs(qty) * self.commission_per_contract
+        else:
+            fee = self.notional(price, qty) * self.commission_rate
+        return max(fee, self.min_commission) if abs(qty) > 0 else 0.0
+
+    def tax(self, price: float, qty: float) -> float:
+        """qty 帶符號：>0 買進、<0 賣出。"""
+        if abs(qty) == 0:
+            return 0.0
+        is_sell = qty < 0
+        if self.tax_on_sell_only and not is_sell:
+            return 0.0
+        return self.notional(price, qty) * self.tax_rate
+
+    def equity_contribution(self, qty: float, avg_price: float, price: float) -> float:
+        """部位對總權益的貢獻 (見模組說明)。"""
+        if self.is_future:
+            return (price - avg_price) * self.multiplier * qty
+        return qty * price
+
+    def margin_requirement(self, qty: float) -> float:
+        return abs(qty) * self.initial_margin if self.is_future else 0.0
+
+
+# ---------- 工廠函式：常見台灣商品 ----------
+
+def tw_stock(symbol: str, name: str = "", *, fee_discount: float = 1.0,
+             day_trade: bool = False) -> Instrument:
+    """
+    台股 (上市/上櫃)。
+    - 手續費 0.1425%，可乘券商折數 fee_discount (例如 0.6 = 6 折)，最低 20 元。
+    - 證交稅 賣出 0.3%；當沖 day_trade=True 時減半為 0.15%。
+    - multiplier 用 1：以「股」為單位下單 (1 張 = 1000 股，數量請自行 *1000)。
+    """
+    return Instrument(
+        symbol=symbol, name=name, is_future=False, multiplier=1.0,
+        commission_rate=0.001425 * fee_discount,
+        min_commission=20.0,
+        tax_rate=0.0015 if day_trade else 0.003,
+        tax_on_sell_only=True,
+    )
+
+
+def tx_future(symbol: str = "TX", name: str = "台指期(大台)", *,
+              multiplier: float = 200.0, initial_margin: float = 167000.0,
+              commission_per_contract: float = 40.0) -> Instrument:
+    """台指期大台：每點 200 元；期交稅 十萬分之二 (0.00002) 買賣皆課。"""
+    return Instrument(
+        symbol=symbol, name=name, is_future=True, multiplier=multiplier,
+        commission_per_contract=commission_per_contract,
+        tax_rate=0.00002, tax_on_sell_only=False,
+        initial_margin=initial_margin,
+    )
+
+
+def mtx_future(symbol: str = "MTX", name: str = "小型台指(小台)") -> Instrument:
+    """小台：每點 50 元，保證金約 1/4。"""
+    return tx_future(symbol, name, multiplier=50.0, initial_margin=41750.0,
+                     commission_per_contract=30.0)
+
+# ===== 來自 backtester/data.py =====
+"""
+資料來源 (Data feeds)
+
+提供統一的 OHLCV DataFrame (index=DatetimeIndex，欄位 open/high/low/close/volume)。
+
+- FinMindFeed：免開戶的免費開源資料，台股日線 + 真實台指期 (TX/MTX) 日線。
+- YFinanceFeed：真實資料，支援台股 (.TW / .TWO) 與加權指數 (^TWII)。
+  會自動把抓回的資料快取成 CSV，避免重複下載。
+- SyntheticFeed：用幾何布朗運動產生模擬資料，讓系統在無網路環境也能跑。
+- CsvFeed：讀取本地 CSV。
+
+台股代碼對照：
+  上市 (TWSE)  -> 數字 + .TW    例：台積電 2330.TW
+  上櫃 (TPEx)  -> 數字 + .TWO   例：3105.TWO
+  加權指數     -> ^TWII         (作為台指期標的代理)
+"""
+
+import os
+from typing import Optional
+import numpy as np
+import pandas as pd
+
+_COLS = ["open", "high", "low", "close", "volume"]
+
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={c: c.lower() for c in df.columns})
+    df = df[[c for c in _COLS if c in df.columns]].copy()
+    df.index = pd.to_datetime(df.index)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df.dropna(subset=["open", "high", "low", "close"])
+
+
+class YFinanceFeed:
+    """以 yfinance 下載資料，並快取到 cache_dir。"""
+
+    def __init__(self, cache_dir: str = ".cache"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def get(self, symbol: str, start: str = "2018-01-01",
+            end: Optional[str] = None, interval: str = "1d",
+            use_cache: bool = True) -> pd.DataFrame:
+        key = f"{symbol}_{start}_{end}_{interval}".replace("^", "IDX_").replace("/", "_")
+        path = os.path.join(self.cache_dir, key + ".csv")
+        if use_cache and os.path.exists(path):
+            return _normalize(pd.read_csv(path, index_col=0))
+
+        import yfinance as yf  # 延遲匯入，未安裝也不影響其他功能
+        raw = yf.download(symbol, start=start, end=end, interval=interval,
+                          auto_adjust=True, progress=False)
+        if raw.empty:
+            raise ValueError(f"yfinance 沒有抓到 {symbol} 的資料，請確認代碼/日期。")
+        if isinstance(raw.columns, pd.MultiIndex):  # 單一標的時攤平欄位
+            raw.columns = raw.columns.get_level_values(0)
+        df = _normalize(raw)
+        df.to_csv(path)
+        return df
+
+
+class CsvFeed:
+    """讀取本地 CSV (需含 open/high/low/close[/volume] 欄與日期 index)。"""
+
+    def __init__(self, directory: str = "."):
+        self.directory = directory
+
+    def get(self, symbol: str, **_) -> pd.DataFrame:
+        path = symbol if os.path.exists(symbol) else os.path.join(self.directory, f"{symbol}.csv")
+        return _normalize(pd.read_csv(path, index_col=0))
+
+
+class SyntheticFeed:
+    """模擬資料：幾何布朗運動 + 日內高低波動，僅供離線測試/示範。"""
+
+    def __init__(self, seed: int = 42):
+        self.rng = np.random.default_rng(seed)
+
+    def get(self, symbol: str, start: str = "2020-01-01", periods: int = 1000,
+            s0: float = 18000.0, mu: float = 0.08, sigma: float = 0.20,
+            **_) -> pd.DataFrame:
+        dt = 1 / 252
+        rets = self.rng.normal((mu - 0.5 * sigma**2) * dt, sigma * np.sqrt(dt), periods)
+        close = s0 * np.exp(np.cumsum(rets))
+        opens = np.concatenate([[s0], close[:-1]])
+        intraday = np.abs(self.rng.normal(0, sigma * np.sqrt(dt) * 0.7, periods)) * close
+        high = np.maximum(opens, close) + intraday
+        low = np.minimum(opens, close) - intraday
+        vol = self.rng.integers(1000, 50000, periods).astype(float)
+        idx = pd.bdate_range(start=start, periods=periods)
+        return _normalize(pd.DataFrame(
+            {"open": opens, "high": high, "low": low, "close": close, "volume": vol},
+            index=idx))
+
+
+# ---------- FinMind 純轉換函式 (可離線單元測試) ----------
+
+# 已知的台指期貨代碼 (FinMind futures_id)；其餘純數字代碼視為股票
+_KNOWN_FUTURES = {"TX", "MTX", "TMF", "TXF", "TE", "TF", "T5F", "XIF", "GTF"}
+
+
+def _finmind_stock_to_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """TaiwanStockPrice -> 標準 OHLCV。欄位：open/max/min/close/Trading_Volume。"""
+    out = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
+    out = out.set_index("date")
+    return _normalize(out)
+
+
+def _finmind_select_front_month(df: pd.DataFrame, prefer_session: str = "position") -> pd.DataFrame:
+    """
+    期貨一天有多個到期月份與日/夜盤，這裡：
+      1) 有 trading_session 欄時，優先取日盤 (prefer_session)，若濾完為空則退回全部
+      2) 濾掉價差(spread)合約 (contract_date 含 '/')
+      3) 每個交易日取「近月」= 最小且尚未到期(到期月 >= 當日年月)的合約，
+         若無則退回該日最小到期月。
+    產生近月連續序列 (月底換月，非回補式連續合約)。
+    """
+    d = df.copy()
+    if "trading_session" in d.columns:
+        reg = d[d["trading_session"].astype(str).str.lower() == prefer_session.lower()]
+        if not reg.empty:
+            d = reg
+    d = d[~d["contract_date"].astype(str).str.contains("/")].copy()
+    d["_ym"] = d["contract_date"].astype(str).str.slice(0, 6)
+    d = d[d["_ym"].str.fullmatch(r"\d{6}")].copy()
+    d["_ym"] = d["_ym"].astype(int)
+    d["_dym"] = pd.to_datetime(d["date"]).dt.strftime("%Y%m").astype(int)
+
+    # 每日取近月：優先「未到期(到期月>=當日年月)」中最小者，否則退回最小到期月。
+    # 以排序 + 去重達成 (向量化，無 groupby.apply)：
+    #   排序鍵 = (date, 未到期優先=0/已過期=1, 到期月由小到大)，每日取第一筆。
+    d["_rank"] = (d["_ym"] < d["_dym"]).astype(int)
+    d = d.sort_values(["date", "_rank", "_ym"])
+    picked = d.drop_duplicates("date", keep="first")
+    return picked.drop(columns=["_ym", "_dym", "_rank"])
+
+
+def _finmind_futures_to_ohlcv(df: pd.DataFrame, prefer_session: str = "position") -> pd.DataFrame:
+    """TaiwanFuturesDaily -> 標準 OHLCV (近月連續)。欄位：open/max/min/close/volume。"""
+    picked = _finmind_select_front_month(df, prefer_session)
+    out = picked.rename(columns={"max": "high", "min": "low"}).set_index("date")
+    return _normalize(out)
+
+
+class FinMindFeed:
+    """
+    FinMind 開源資料 (免開戶免費)。台股日線 + 真實台指期日線。
+
+    代碼規則：
+      - 純數字 (如 '2330'、'0050')         -> 台股日線
+      - 期貨代碼 (如 'TX' 大台、'MTX' 小台) -> 期貨日線 (近月連續)
+      - 也可用 asset='stock' / 'future' 明確指定
+
+    token 非必填：未登入 300 次/小時；註冊後帶 token 提升到 600 次/小時。
+    可用環境變數 FINMIND_TOKEN 提供。
+    """
+
+    def __init__(self, token: Optional[str] = None, cache_dir: str = ".cache",
+                 prefer_session: str = "position"):
+        self.token = token or os.getenv("FINMIND_TOKEN")
+        self.cache_dir = cache_dir
+        self.prefer_session = prefer_session
+        os.makedirs(cache_dir, exist_ok=True)
+        self._dl = None
+
+    def _loader(self):
+        if self._dl is None:
+            from FinMind.data import DataLoader  # 延遲匯入
+            self._dl = DataLoader()
+            if self.token:
+                self._dl.login_by_token(api_token=self.token)
+        return self._dl
+
+    @staticmethod
+    def _is_future(symbol: str, asset: Optional[str]) -> bool:
+        if asset:
+            return asset.lower().startswith("fut")
+        return not symbol.isdigit()          # 純數字=股票，其餘=期貨
+
+    def get(self, symbol: str, start: str = "2018-01-01",
+            end: Optional[str] = None, asset: Optional[str] = None,
+            use_cache: bool = True) -> pd.DataFrame:
+        end = end or ""
+        is_fut = self._is_future(symbol, asset)
+        kind = "fut" if is_fut else "stk"
+        path = os.path.join(self.cache_dir, f"finmind_{kind}_{symbol}_{start}_{end}.csv")
+        if use_cache and os.path.exists(path):
+            return _normalize(pd.read_csv(path, index_col=0))
+
+        dl = self._loader()
+        if is_fut:
+            raw = dl.taiwan_futures_daily(futures_id=symbol, start_date=start, end_date=end)
+            if raw is None or raw.empty:
+                raise ValueError(f"FinMind 沒有抓到期貨 {symbol} 的資料。")
+            df = _finmind_futures_to_ohlcv(raw, self.prefer_session)
+        else:
+            raw = dl.taiwan_stock_daily(stock_id=symbol, start_date=start, end_date=end)
+            if raw is None or raw.empty:
+                raise ValueError(f"FinMind 沒有抓到股票 {symbol} 的資料。")
+            df = _finmind_stock_to_ohlcv(raw)
+        df.to_csv(path)
+        return df
+
+# ===== 來自 backtester/portfolio.py =====
+"""
+投資組合與部位 (Portfolio & Position)
+
+- Position：單一商品的數量(帶符號)與平均成本，並能套用一筆成交計算已實現損益。
+- Portfolio：現金、所有部位、權益曲線、成交紀錄、保證金使用量。
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+import pandas as pd
+
+
+
+@dataclass
+class Position:
+    qty: float = 0.0          # 帶符號：正=多、負=空
+    avg_price: float = 0.0    # 平均進場價 (恆為正)
+
+    def apply(self, dq: float, price: float, multiplier: float) -> float:
+        """
+        套用一筆成交 dq (帶符號)，回傳本次「已實現損益(以貨幣計)」。
+        - 同方向加碼 -> 重算平均價，無已實現損益
+        - 反方向 -> 平倉部分計算損益；若超量則反手建立新部位
+        """
+        realized = 0.0
+        if self.qty == 0:
+            self.qty, self.avg_price = dq, price
+        elif (self.qty > 0) == (dq > 0):                      # 加碼
+            total = self.qty + dq
+            self.avg_price = (self.avg_price * abs(self.qty) + price * abs(dq)) / abs(total)
+            self.qty = total
+        else:                                                 # 反向：平倉/反手
+            direction = 1 if self.qty > 0 else -1
+            closing = min(abs(dq), abs(self.qty))
+            realized = (price - self.avg_price) * closing * direction * multiplier
+            self.qty += dq
+            if self.qty == 0:
+                self.avg_price = 0.0
+            elif (self.qty > 0) != (direction > 0):           # 反手
+                self.avg_price = price
+        return realized
+
+
+@dataclass
+class Portfolio:
+    initial_cash: float
+    cash: float = field(init=False)
+    positions: Dict[str, Position] = field(default_factory=dict)
+    instruments: Dict[str, Instrument] = field(default_factory=dict)
+    equity_curve: List[dict] = field(default_factory=list)
+    trades: List[dict] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.cash = self.initial_cash
+
+    def position(self, symbol: str) -> Position:
+        return self.positions.setdefault(symbol, Position())
+
+    def register(self, inst: Instrument):
+        self.instruments[inst.symbol] = inst
+
+    # --- 評價 ---
+    def equity(self, prices: Dict[str, float]) -> float:
+        total = self.cash
+        for sym, pos in self.positions.items():
+            if pos.qty == 0 or sym not in prices:
+                continue
+            total += self.instruments[sym].equity_contribution(pos.qty, pos.avg_price, prices[sym])
+        return total
+
+    def margin_used(self) -> float:
+        return sum(self.instruments[s].margin_requirement(p.qty)
+                   for s, p in self.positions.items() if p.qty != 0)
+
+    def record_equity(self, ts, prices: Dict[str, float]):
+        self.equity_curve.append({"datetime": ts, "equity": self.equity(prices),
+                                  "cash": self.cash, "margin_used": self.margin_used()})
+
+    def record_trade(self, ts, symbol: str, qty: float, price: float,
+                     fee: float, tax: float, realized: float):
+        self.trades.append({"datetime": ts, "symbol": symbol, "qty": qty,
+                            "price": price, "fee": fee, "tax": tax,
+                            "realized_pnl": realized})
+
+    def equity_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.equity_curve).set_index("datetime") if self.equity_curve else pd.DataFrame()
+
+    def trades_df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.trades)
+
+# ===== 來自 backtester/broker.py =====
+"""
+撮合與下單 (Broker / Order)
+
+- Order：市價單，數量帶符號 (>0 買、<0 賣)。
+- Broker：依「下一根開盤價 + 滑價」成交，計算手續費/稅，更新 Portfolio。
+  期貨另檢查保證金是否足夠 (allow_margin_breach=False 時不足則拒單)。
+
+避免未來函數：策略在第 t 根收盤後送單，於第 t+1 根「開盤價」成交。
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+
+@dataclass
+class Order:
+    instrument: Instrument
+    quantity: float          # 帶符號
+    note: str = ""
+
+
+class Broker:
+    def __init__(self, slippage: float = 0.0005, allow_margin_breach: bool = False,
+                 verbose: bool = False):
+        self.slippage = slippage          # 以成交價比例計
+        self.allow_margin_breach = allow_margin_breach
+        self.verbose = verbose
+
+    def _fill_price(self, ref_price: float, qty: float) -> float:
+        # 買進往上滑、賣出往下滑
+        return ref_price * (1 + self.slippage) if qty > 0 else ref_price * (1 - self.slippage)
+
+    def execute(self, order: Order, ref_price: float, portfolio: Portfolio, ts,
+                force: bool = False) -> bool:
+        """force=True 用於強制平倉(margin call)，跳過事前保證金/現金檢查。"""
+        inst = order.instrument
+        dq = order.quantity
+        if dq == 0 or ref_price <= 0:
+            return False
+        price = self._fill_price(ref_price, dq)
+        pos = portfolio.position(inst.symbol)
+
+        # 預估成交後的現金與保證金，做事前檢查
+        fee = inst.commission(price, dq)
+        tax = inst.tax(price, dq)
+
+        if not force and not self.allow_margin_breach:
+            if inst.is_future:
+                projected_qty = pos.qty + dq
+                need = inst.margin_requirement(projected_qty) - inst.margin_requirement(pos.qty)
+                # 反向減倉 need 可能為負(釋出保證金)，僅在加碼/反手需額外保證金時檢查
+                if need > 0 and (portfolio.cash - portfolio.margin_used()) < need + fee + tax:
+                    if self.verbose:
+                        print(f"[拒單] {ts} {inst.symbol} 保證金不足 need={need:.0f}")
+                    return False
+            else:
+                if dq > 0 and portfolio.cash < dq * price + fee + tax:
+                    if self.verbose:
+                        print(f"[拒單] {ts} {inst.symbol} 現金不足")
+                    return False
+
+        realized = pos.apply(dq, price, inst.multiplier)
+        if inst.is_future:
+            portfolio.cash += realized - fee - tax       # 期貨：僅損益與成本進出現金
+        else:
+            portfolio.cash += -dq * price - fee - tax     # 股票：名目價金進出現金
+
+        portfolio.record_trade(ts, inst.symbol, dq, price, fee, tax, realized)
+        if self.verbose:
+            side = "買" if dq > 0 else "賣"
+            print(f"[成交] {ts} {side} {inst.symbol} x{abs(dq):g} @ {price:.2f} "
+                  f"fee={fee:.0f} tax={tax:.0f} realized={realized:.0f}")
+        return True
+
+# ===== 來自 backtester/strategy.py =====
+"""
+策略 (Strategy)
+
+策略只負責「看資料、產生訂單」，不碰撮合與會計。
+
+介面：
+- prepare(data): 一次性計算指標 (可對整段序列計算；引擎只會在 on_bar 讀取
+  「當前 bar 以前」的值，因此不構成未來函數)。
+- on_bar(ts, data, idx, portfolio): 回傳 List[Order]，在「下一根開盤」成交。
+
+data : Dict[symbol -> DataFrame]
+idx  : Dict[symbol -> 該商品在當前 ts 的整數列位置 (iloc)，無資料則為 None]
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
+import pandas as pd
+
+
+
+class Strategy(ABC):
+    def __init__(self, instrument: Instrument):
+        self.instrument = instrument
+        self.sym = instrument.symbol
+
+    def prepare(self, data: Dict[str, pd.DataFrame]):
+        pass
+
+    @abstractmethod
+    def on_bar(self, ts, data: Dict[str, pd.DataFrame],
+               idx: Dict[str, Optional[int]], portfolio: Portfolio) -> List[Order]:
+        ...
+
+    # 小工具
+    def current_qty(self, portfolio: Portfolio) -> float:
+        return portfolio.position(self.sym).qty
+
+
+class MACrossStrategy(Strategy):
+    """
+    均線交叉 (適合台股、做多為主)。
+    - 短均線上穿長均線 -> 全額買進 (以可用現金的 size_pct 計，整張為單位)。
+    - 短均線下穿長均線 -> 全部出清。
+    """
+
+    def __init__(self, instrument: Instrument, fast: int = 20, slow: int = 60,
+                 lot_size: int = 1000, size_pct: float = 0.95):
+        super().__init__(instrument)
+        self.fast, self.slow = fast, slow
+        self.lot_size, self.size_pct = lot_size, size_pct
+
+    def prepare(self, data):
+        df = data[self.sym]
+        df["ma_fast"] = df["close"].rolling(self.fast).mean()
+        df["ma_slow"] = df["close"].rolling(self.slow).mean()
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.slow:
+            return []
+        df = data[self.sym]
+        f0, s0 = df["ma_fast"].iloc[i], df["ma_slow"].iloc[i]
+        f1, s1 = df["ma_fast"].iloc[i - 1], df["ma_slow"].iloc[i - 1]
+        price = df["close"].iloc[i]
+        qty = self.current_qty(portfolio)
+        orders = []
+        cross_up = f1 <= s1 and f0 > s0
+        cross_dn = f1 >= s1 and f0 < s0
+        if cross_up and qty == 0:
+            budget = portfolio.cash * self.size_pct
+            lots = int(budget // (price * self.lot_size))
+            if lots > 0:
+                orders.append(Order(self.instrument, lots * self.lot_size, "MA 黃金交叉買進"))
+        elif cross_dn and qty > 0:
+            orders.append(Order(self.instrument, -qty, "MA 死亡交叉出清"))
+        return orders
+
+
+class FuturesBreakoutStrategy(Strategy):
+    """
+    通道突破 (適合台指期，可多可空)。
+    - 收盤突破近 N 根最高 -> 做多 contracts 口 (先平空)。
+    - 收盤跌破近 N 根最低 -> 做空 contracts 口 (先平多)。
+    """
+
+    def __init__(self, instrument: Instrument, lookback: int = 20, contracts: int = 1):
+        super().__init__(instrument)
+        self.lookback, self.contracts = lookback, contracts
+
+    def prepare(self, data):
+        df = data[self.sym]
+        # 用「前一根為止」的通道，避免把當根最高/最低算進去
+        df["hh"] = df["high"].rolling(self.lookback).max().shift(1)
+        df["ll"] = df["low"].rolling(self.lookback).min().shift(1)
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.lookback:
+            return []
+        df = data[self.sym]
+        close = df["close"].iloc[i]
+        hh, ll = df["hh"].iloc[i], df["ll"].iloc[i]
+        qty = self.current_qty(portfolio)
+        orders = []
+        if close > hh and qty <= 0:                       # 轉多
+            orders.append(Order(self.instrument, self.contracts - qty, "向上突破做多"))
+        elif close < ll and qty >= 0:                     # 轉空
+            orders.append(Order(self.instrument, -self.contracts - qty, "向下跌破做空"))
+        return orders
+
+# ===== 來自 backtester/metrics.py =====
+"""
+績效指標 (Performance metrics)
+
+輸入權益曲線 (equity curve) 與成交紀錄，輸出常見回測指標。
+"""
+
+from typing import Dict
+import numpy as np
+import pandas as pd
+
+TRADING_DAYS = 252
+
+
+def _annualization_factor(index: pd.DatetimeIndex) -> float:
+    if len(index) < 3:
+        return TRADING_DAYS
+    days = np.median(np.diff(index.values).astype("timedelta64[D]").astype(float))
+    days = max(days, 1.0)
+    return 365.0 / days
+
+
+def compute_metrics(equity: pd.DataFrame, trades: pd.DataFrame,
+                    initial_cash: float) -> Dict[str, float]:
+    if equity.empty:
+        return {}
+    eq = equity["equity"].astype(float)
+    ruined = bool((eq <= 0).any())
+    # 計算報酬時，權益觸及 0 以下會讓百分比統計失真，故以正值下限保護
+    eq_safe = eq.clip(lower=1.0)
+    rets = eq_safe.pct_change().dropna()
+    ann = _annualization_factor(eq.index)
+
+    total_return = eq.iloc[-1] / initial_cash - 1.0
+    years = max((eq.index[-1] - eq.index[0]).days / 365.0, 1e-9)
+    base = max(eq.iloc[-1], 0.0)
+    cagr = (base / initial_cash) ** (1 / years) - 1.0 if base > 0 else -1.0
+
+    vol = rets.std() * np.sqrt(ann) if len(rets) > 1 else 0.0
+    sharpe = (rets.mean() * ann) / (rets.std() * np.sqrt(ann)) if rets.std() > 0 else 0.0
+    downside = rets[rets < 0]
+    sortino = (rets.mean() * ann) / (downside.std() * np.sqrt(ann)) if len(downside) > 1 and downside.std() > 0 else 0.0
+
+    roll_max = eq.cummax()
+    drawdown = (eq / roll_max - 1.0).clip(lower=-1.0)   # 回撤下限 -100%
+    max_dd = drawdown.min()
+    calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
+
+    # 交易層面 (以已實現損益不為 0 的平倉交易計)
+    n_trades = win_rate = profit_factor = avg_win = avg_loss = 0.0
+    if not trades.empty and "realized_pnl" in trades:
+        closed = trades[trades["realized_pnl"] != 0]["realized_pnl"]
+        n_trades = int(len(closed))
+        if n_trades:
+            wins, losses = closed[closed > 0], closed[closed < 0]
+            win_rate = len(wins) / n_trades
+            gross_win, gross_loss = wins.sum(), -losses.sum()
+            profit_factor = gross_win / gross_loss if gross_loss > 0 else float("inf")
+            avg_win = wins.mean() if len(wins) else 0.0
+            avg_loss = losses.mean() if len(losses) else 0.0
+
+    return {
+        "初始資金": initial_cash,
+        "期末權益": float(eq.iloc[-1]),
+        "總報酬率": total_return,
+        "年化報酬(CAGR)": cagr,
+        "年化波動": vol,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "最大回撤(MDD)": max_dd,
+        "Calmar": calmar,
+        "平倉次數": n_trades,
+        "勝率": win_rate,
+        "獲利因子": profit_factor,
+        "平均獲利": avg_win,
+        "平均虧損": avg_loss,
+        "是否爆倉": ruined,
+    }
+
+
+def format_report(metrics: Dict[str, float]) -> str:
+    if not metrics:
+        return "（無資料）"
+    pct = {"總報酬率", "年化報酬(CAGR)", "年化波動", "最大回撤(MDD)", "勝率"}
+    money = {"初始資金", "期末權益", "平均獲利", "平均虧損"}
+    lines = ["─" * 40, f"{'回測績效報告':^32}", "─" * 40]
+    for k, v in metrics.items():
+        if k == "是否爆倉":
+            s = "是 ⚠️" if v else "否"
+        elif k in pct:
+            s = f"{v*100:,.2f}%"
+        elif k in money:
+            s = f"{v:,.0f}"
+        elif k == "平倉次數":
+            s = f"{int(v)}"
+        else:
+            s = f"{v:,.2f}"
+        lines.append(f"{k:<16}{s:>22}")
+    lines.append("─" * 40)
+    return "\n".join(lines)
+
+# ===== 來自 backtester/engine.py =====
+"""
+回測引擎 (Backtest engine)
+
+事件驅動逐根 bar 主迴圈，流程 (對齊所有商品的時間軸)：
+  對每一個時間點 ts：
+    1) 用「本根開盤價」撮合上一根產生的待成交訂單  -> 無未來函數
+    2) 用「本根收盤價」逐日結算 (mark-to-market)，記錄權益
+    3) 策略看「到本根收盤為止」的資料，產生下一批訂單
+最後一根產生的訂單不會成交 (沒有下一根)，符合實務。
+"""
+
+from typing import Dict, List, Optional
+import pandas as pd
+
+
+
+class Backtest:
+    def __init__(self, strategies: List[Strategy], data: Dict[str, pd.DataFrame],
+                 initial_cash: float = 1_000_000.0, broker: Optional[Broker] = None,
+                 maintenance_ratio: float = 0.75):
+        self.strategies = strategies
+        self.data = {s: df.copy() for s, df in data.items()}
+        self.broker = broker or Broker()
+        self.portfolio = Portfolio(initial_cash=initial_cash)
+        self.maintenance_ratio = maintenance_ratio   # 維持保證金 / 原始保證金
+        self.halted = False                           # 爆倉後停止交易
+        for st in strategies:
+            self.portfolio.register(st.instrument)
+        self._inst = {st.instrument.symbol: st.instrument for st in strategies}
+
+    def _margin_call(self, prices: Dict[str, float], ts) -> bool:
+        """權益跌破維持保證金或 <=0 -> 以收盤強制平倉所有部位。"""
+        equity = self.portfolio.equity(prices)
+        maint = self.portfolio.margin_used() * self.maintenance_ratio
+        if self.portfolio.margin_used() > 0 and (equity <= 0 or equity < maint):
+            for sym, pos in list(self.portfolio.positions.items()):
+                if pos.qty != 0 and sym in prices:
+                    self.broker.execute(Order(self._inst[sym], -pos.qty, "強制平倉"),
+                                        prices[sym], self.portfolio, ts, force=True)
+            self.halted = True
+            return True
+        return False
+
+    def run(self) -> Dict[str, float]:
+        for st in self.strategies:
+            st.prepare(self.data)
+
+        # 建立共同時間軸 (所有商品時間戳的聯集)，並建立各商品 ts->iloc 對照
+        timeline = sorted(set().union(*[df.index for df in self.data.values()]))
+        pos_map = {s: {ts: i for i, ts in enumerate(df.index)} for s, df in self.data.items()}
+
+        pending: List[Order] = []
+        for ts in timeline:
+            # 1) 撮合上一根送出的訂單，以本根開盤價成交
+            still_pending: List[Order] = []
+            for order in pending:
+                sym = order.instrument.symbol
+                i = pos_map[sym].get(ts)
+                if i is None:                      # 本商品本根無資料，順延
+                    still_pending.append(order)
+                    continue
+                open_px = float(self.data[sym]["open"].iloc[i])
+                self.broker.execute(order, open_px, self.portfolio, ts)
+            pending = still_pending
+
+            # 2) 以本根收盤逐日結算
+            prices = {s: float(self.data[s]["close"].iloc[pos_map[s][ts]])
+                      for s in self.data if ts in pos_map[s]}
+
+            # 2b) 保證金維持檢查：跌破則強制平倉並停止交易
+            if not self.halted:
+                self._margin_call(prices, ts)
+
+            self.portfolio.record_equity(ts, prices)
+
+            # 3) 策略產生下一批訂單 (爆倉後停止)
+            if self.halted:
+                pending = []
+                continue
+            idx = {s: pos_map[s].get(ts) for s in self.data}
+            for st in self.strategies:
+                pending.extend(st.on_bar(ts, self.data, idx, self.portfolio))
+
+        return compute_metrics(self.portfolio.equity_df(),
+                                 self.portfolio.trades_df(),
+                                 self.portfolio.initial_cash)
+
+    # 方便取用結果
+    def equity_curve(self) -> pd.DataFrame:
+        return self.portfolio.equity_df()
+
+    def trades(self) -> pd.DataFrame:
+        return self.portfolio.trades_df()
+
+# ===== Streamlit 介面 (來自 app.py) =====
+"""
+回測操作面板 (Streamlit)
+
+啟動：
+    pip install -r requirements.txt
+    streamlit run app.py
+
+側邊欄選資料源／商品／策略／參數 -> 按「執行回測」-> 主畫面顯示績效、權益曲線、回撤、成交明細。
+所有運算都呼叫 backtester 套件的真實引擎；資料源支援 FinMind / yfinance / 模擬資料。
+"""
+
+import pandas as pd
+import streamlit as st
+
+
+# ---------- 核心邏輯 (與 UI 分離，方便測試) ----------
+
+@st.cache_data(show_spinner=False)
+def load_data(source: str, symbol: str, asset: str, start: str, end: str,
+              token: str, syn_periods: int, syn_s0: float, syn_sigma: float) -> pd.DataFrame:
+    """抓資料並回傳標準 OHLCV。用 cache 避免重複下載/消耗 API 額度。"""
+    if source == "FinMind":
+        return FinMindFeed(token=token or None).get(symbol, start=start, end=end, asset=asset)
+    if source == "yfinance":
+        return YFinanceFeed().get(symbol, start=start, end=end)
+    # 模擬
+    s0 = syn_s0 if asset == "future" else min(syn_s0, 1000)
+    return SyntheticFeed(seed=7).get("SIM", periods=syn_periods, s0=s0, sigma=syn_sigma)
+
+
+def build_instrument(cfg: dict) -> Instrument:
+    if cfg["asset"] == "future":
+        return (mtx_future(cfg["symbol"]) if cfg["fut_kind"] == "小台 MTX"
+                else tx_future(cfg["symbol"]))
+    return tw_stock(cfg["symbol"], fee_discount=cfg["fee_discount"])
+
+
+def build_strategy(inst: Instrument, cfg: dict) -> Strategy:
+    if cfg["strategy"] == "均線交叉":
+        return MACrossStrategy(inst, fast=cfg["fast"], slow=cfg["slow"],
+                                  lot_size=cfg["lot_size"], size_pct=cfg["size_pct"])
+    return FuturesBreakoutStrategy(inst, lookback=cfg["lookback"], contracts=cfg["contracts"])
+
+
+def run_backtest(df: pd.DataFrame, cfg: dict):
+    """回傳 (metrics, equity_df, trades_df)。純函式，無 Streamlit 相依。"""
+    inst = build_instrument(cfg)
+    strat = build_strategy(inst, cfg)
+    broker = Broker(slippage=cfg["slippage"])
+    eng = Backtest([strat], {inst.symbol: df}, initial_cash=cfg["cash"], broker=broker)
+    metrics = eng.run()
+    return metrics, eng.equity_curve(), eng.trades()
+
+
+def drawdown_series(equity: pd.Series) -> pd.Series:
+    return (equity / equity.cummax() - 1.0).clip(lower=-1.0)
+
+
+def secret_token() -> str:
+    """雲端部署時從 st.secrets 讀 FINMIND_TOKEN；本機無 secrets 檔則回傳空字串。"""
+    try:
+        return st.secrets.get("FINMIND_TOKEN", "")
+    except Exception:
+        return ""
+
+
+# ---------- UI ----------
+
+st.set_page_config(page_title="台股/台指期 回測面板", page_icon="📈", layout="wide")
+st.title("📈 台股 / 台指期 回測操作面板")
+st.caption("事件驅動引擎 · 真實資料源 (FinMind / yfinance) · 避免未來函數 · 期貨保證金與強制平倉")
+
+with st.sidebar:
+    st.header("⚙️ 控制面板")
+
+    source = st.selectbox("資料來源", ["FinMind", "yfinance", "模擬資料"],
+                          help="FinMind 免開戶免費、含真實台指期；yfinance 無台指期連續合約；模擬資料供離線測試")
+    token = ""
+    if source == "FinMind":
+        token = st.text_input("FinMind token（選填）", type="password",
+                              help="留空為 300 次/小時；填入提升到 600 次/小時。"
+                                   "雲端部署時可改在 App 的 Secrets 設定 FINMIND_TOKEN，這裡留空即可自動帶入")
+        if not token:
+            token = secret_token()   # 雲端 secrets 後備
+
+    asset_label = st.radio("商品類型", ["股票", "期貨"], horizontal=True)
+    asset = "future" if asset_label == "期貨" else "stock"
+
+    fut_kind = "大台 TX"
+    if asset == "future":
+        fut_kind = st.selectbox("期貨契約", ["大台 TX", "小台 MTX"])
+        default_symbol = "MTX" if fut_kind == "小台 MTX" else "TX"
+        if source == "yfinance":
+            default_symbol = "^TWII"   # yfinance 用加權指數代理
+    else:
+        default_symbol = "2330.TW" if source == "yfinance" else "2330"
+
+    symbol = st.text_input("標的代碼", value=default_symbol)
+
+    c1, c2 = st.columns(2)
+    start = c1.date_input("起始日期", value=pd.Timestamp("2019-01-01")).strftime("%Y-%m-%d")
+    end = c2.date_input("結束日期", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+
+    st.divider()
+    default_strat = "通道突破" if asset == "future" else "均線交叉"
+    strategy = st.selectbox("策略", ["均線交叉", "通道突破"],
+                            index=0 if default_strat == "均線交叉" else 1)
+
+    cfg = {"asset": asset, "fut_kind": fut_kind, "symbol": symbol, "strategy": strategy}
+    if strategy == "均線交叉":
+        cfg["fast"] = st.slider("短均線", 3, 60, 20)
+        cfg["slow"] = st.slider("長均線", 10, 240, 60)
+        cfg["lot_size"] = st.number_input("每筆股數", 1, 100000, 1000, step=1000)
+        cfg["size_pct"] = st.slider("資金投入比例", 0.1, 1.0, 0.95)
+    else:
+        cfg["lookback"] = st.slider("通道回看天數", 5, 120, 20)
+        cfg["contracts"] = st.number_input("每次口數/張數", 1, 50, 1)
+
+    st.divider()
+    cfg["cash"] = st.number_input("初始資金 (NT$)", 100000, 100000000, 1000000, step=100000)
+    with st.expander("交易成本 / 進階"):
+        cfg["slippage"] = st.slider("滑價 (比例)", 0.0, 0.005, 0.0005, step=0.0001, format="%.4f")
+        cfg["fee_discount"] = st.slider("股票手續費折數", 0.1, 1.0, 0.6,
+                                        help="例如 0.6 = 6 折；期貨不適用")
+
+    # 模擬資料參數
+    cfg["syn_periods"] = 1000
+    cfg["syn_s0"] = 18000.0 if asset == "future" else 600.0
+    cfg["syn_sigma"] = 0.18 if asset == "future" else 0.28
+
+    run = st.button("🚀 執行回測", type="primary", use_container_width=True)
+
+
+# ---------- 執行與結果 ----------
+
+if not run:
+    st.info("在左側設定條件後，點「執行回測」。\n\n"
+            "建議：做台指期回測選 **FinMind + 期貨 + TX**（免開戶、有真實近月連續日線）。")
+    st.stop()
+
+try:
+    with st.spinner("抓取資料中…"):
+        df = load_data(source, symbol, asset, start, end, token,
+                       cfg["syn_periods"], cfg["syn_s0"], cfg["syn_sigma"])
+except Exception as e:
+    st.error(f"資料取得失敗（{type(e).__name__}）：{e}\n\n"
+             "若在無外網環境，請改用「模擬資料」；FinMind 額度用盡可稍後再試或填 token。")
+    st.stop()
+
+if df is None or df.empty or len(df) < 10:
+    st.warning("資料筆數不足，請調整代碼或日期區間。")
+    st.stop()
+
+with st.spinner("回測運算中…"):
+    metrics, equity, trades = run_backtest(df, cfg)
+
+src_note = f"{source}｜{symbol}｜{df.index.min().date()} ~ {df.index.max().date()}｜{len(df)} 根"
+st.success(f"完成：{src_note}")
+
+# --- 績效指標卡 ---
+def pct(x): return f"{x*100:,.2f}%"
+m = metrics
+r1 = st.columns(4)
+r1[0].metric("總報酬率", pct(m["總報酬率"]))
+r1[1].metric("年化報酬 (CAGR)", pct(m["年化報酬(CAGR)"]))
+r1[2].metric("Sharpe", f"{m['Sharpe']:.2f}")
+r1[3].metric("最大回撤 (MDD)", pct(m["最大回撤(MDD)"]))
+r2 = st.columns(4)
+r2[0].metric("勝率", pct(m["勝率"]))
+r2[1].metric("獲利因子", f"{m['獲利因子']:.2f}")
+r2[2].metric("平倉次數", f"{int(m['平倉次數'])}")
+r2[3].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
+
+# --- 圖表 ---
+left, right = st.columns([3, 2])
+with left:
+    st.subheader("權益曲線")
+    st.line_chart(equity["equity"], height=300)
+    st.subheader("回撤")
+    st.area_chart(drawdown_series(equity["equity"]), height=180, color="#c0392b")
+with right:
+    st.subheader("摘要")
+    st.dataframe(pd.DataFrame({"指標": list(m.keys()),
+                              "數值": [f"{v}" for v in m.values()]}),
+                 hide_index=True, use_container_width=True, height=500)
+
+# --- 成交明細 + 下載 ---
+st.subheader(f"成交明細（{len(trades)} 筆）")
+st.dataframe(trades, use_container_width=True, height=260)
+
+d1, d2 = st.columns(2)
+d1.download_button("⬇️ 下載權益曲線 CSV", equity.to_csv().encode("utf-8-sig"),
+                   file_name="equity_curve.csv", mime="text/csv", use_container_width=True)
+d2.download_button("⬇️ 下載成交明細 CSV", trades.to_csv(index=False).encode("utf-8-sig"),
+                   file_name="trades.csv", mime="text/csv", use_container_width=True)
