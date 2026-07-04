@@ -3,3 +3,4 @@ pandas>=2.2
 numpy>=1.24
 yfinance>=0.2.40
 finmind>=1.9
+tqdm>=4.0
