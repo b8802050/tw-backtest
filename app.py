@@ -429,14 +429,21 @@ class Broker:
 # --- backtester/strategy.py ---
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
+import numpy as np
 import pandas as pd
 
 
 
 class Strategy(ABC):
-    def __init__(self, instrument: Instrument):
+    def __init__(self, instrument: Instrument, lot_size: int = 1000, size_pct: float = 0.95,
+                 contracts: int = 1, allow_short: Optional[bool] = None):
         self.instrument = instrument
         self.sym = instrument.symbol
+        self.lot_size = lot_size
+        self.size_pct = size_pct
+        self.contracts = contracts
+        # 預設：期貨可做空、股票不做空
+        self.allow_short = instrument.is_future if allow_short is None else allow_short
 
     def prepare(self, data: Dict[str, pd.DataFrame]):
         pass
@@ -446,23 +453,43 @@ class Strategy(ABC):
                idx: Dict[str, Optional[int]], portfolio: Portfolio) -> List[Order]:
         ...
 
-    # 小工具
+    # ---- 共用工具 ----
     def current_qty(self, portfolio: Portfolio) -> float:
         return portfolio.position(self.sym).qty
 
+    def full_size(self, price: float, portfolio: Portfolio) -> float:
+        if self.instrument.is_future:
+            return self.contracts
+        budget = portfolio.cash * self.size_pct
+        return int(budget // (price * self.lot_size)) * self.lot_size
+
+    def trade_to_target(self, target: int, price: float, portfolio: Portfolio,
+                        note: str = "") -> List[Order]:
+        if target < 0 and not self.allow_short:
+            target = 0
+        cur = self.current_qty(portfolio)
+        if target > 0 and cur > 0:
+            return []
+        if target < 0 and cur < 0:
+            return []
+        if target == 0 and cur == 0:
+            return []
+        size = self.full_size(price, portfolio)
+        if target != 0 and size == 0:      # 資金不足以建立部位
+            return []
+        desired = target * size
+        dq = desired - cur
+        return [Order(self.instrument, dq, note)] if dq != 0 else []
+
+
+# ---------- 各策略 ----------
 
 class MACrossStrategy(Strategy):
-    """
-    均線交叉 (適合台股、做多為主)。
-    - 短均線上穿長均線 -> 全額買進 (以可用現金的 size_pct 計，整張為單位)。
-    - 短均線下穿長均線 -> 全部出清。
-    """
+    """均線交叉：短均線在長均線之上做多，反之空手（期貨可做空）。"""
 
-    def __init__(self, instrument: Instrument, fast: int = 20, slow: int = 60,
-                 lot_size: int = 1000, size_pct: float = 0.95):
-        super().__init__(instrument)
+    def __init__(self, instrument, fast: int = 20, slow: int = 60, **kw):
+        super().__init__(instrument, **kw)
         self.fast, self.slow = fast, slow
-        self.lot_size, self.size_pct = lot_size, size_pct
 
     def prepare(self, data):
         df = data[self.sym]
@@ -474,37 +501,21 @@ class MACrossStrategy(Strategy):
         if i is None or i < self.slow:
             return []
         df = data[self.sym]
-        f0, s0 = df["ma_fast"].iloc[i], df["ma_slow"].iloc[i]
-        f1, s1 = df["ma_fast"].iloc[i - 1], df["ma_slow"].iloc[i - 1]
+        f, s = df["ma_fast"].iloc[i], df["ma_slow"].iloc[i]
         price = df["close"].iloc[i]
-        qty = self.current_qty(portfolio)
-        orders = []
-        cross_up = f1 <= s1 and f0 > s0
-        cross_dn = f1 >= s1 and f0 < s0
-        if cross_up and qty == 0:
-            budget = portfolio.cash * self.size_pct
-            lots = int(budget // (price * self.lot_size))
-            if lots > 0:
-                orders.append(Order(self.instrument, lots * self.lot_size, "MA 黃金交叉買進"))
-        elif cross_dn and qty > 0:
-            orders.append(Order(self.instrument, -qty, "MA 死亡交叉出清"))
-        return orders
+        target = 1 if f > s else (-1 if self.allow_short else 0)
+        return self.trade_to_target(target, price, portfolio, "均線交叉")
 
 
 class FuturesBreakoutStrategy(Strategy):
-    """
-    通道突破 (適合台指期，可多可空)。
-    - 收盤突破近 N 根最高 -> 做多 contracts 口 (先平空)。
-    - 收盤跌破近 N 根最低 -> 做空 contracts 口 (先平多)。
-    """
+    """通道突破：收盤突破近 N 根高點做多、跌破低點做空，否則抱單。"""
 
-    def __init__(self, instrument: Instrument, lookback: int = 20, contracts: int = 1):
-        super().__init__(instrument)
-        self.lookback, self.contracts = lookback, contracts
+    def __init__(self, instrument, lookback: int = 20, **kw):
+        super().__init__(instrument, **kw)
+        self.lookback = lookback
 
     def prepare(self, data):
         df = data[self.sym]
-        # 用「前一根為止」的通道，避免把當根最高/最低算進去
         df["hh"] = df["high"].rolling(self.lookback).max().shift(1)
         df["ll"] = df["low"].rolling(self.lookback).min().shift(1)
 
@@ -513,15 +524,143 @@ class FuturesBreakoutStrategy(Strategy):
         if i is None or i < self.lookback:
             return []
         df = data[self.sym]
-        close = df["close"].iloc[i]
-        hh, ll = df["hh"].iloc[i], df["ll"].iloc[i]
-        qty = self.current_qty(portfolio)
-        orders = []
-        if close > hh and qty <= 0:                       # 轉多
-            orders.append(Order(self.instrument, self.contracts - qty, "向上突破做多"))
-        elif close < ll and qty >= 0:                     # 轉空
-            orders.append(Order(self.instrument, -self.contracts - qty, "向下跌破做空"))
-        return orders
+        close, hh, ll = df["close"].iloc[i], df["hh"].iloc[i], df["ll"].iloc[i]
+        if close > hh:
+            return self.trade_to_target(1, close, portfolio, "向上突破")
+        if close < ll:
+            return self.trade_to_target(-1 if self.allow_short else 0, close, portfolio, "向下跌破")
+        return []
+
+
+class RSIStrategy(Strategy):
+    """RSI 超買超賣（均值回歸）：RSI 低於超賣做多、高於超買出場（期貨可反手做空）。"""
+
+    def __init__(self, instrument, period: int = 14, oversold: int = 30,
+                 overbought: int = 70, **kw):
+        super().__init__(instrument, **kw)
+        self.period, self.oversold, self.overbought = period, oversold, overbought
+
+    def prepare(self, data):
+        df = data[self.sym]
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).rolling(self.period).mean()
+        loss = (-delta.clip(upper=0)).rolling(self.period).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df["rsi"] = (100 - 100 / (1 + rs)).fillna(50)
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.period + 1:
+            return []
+        df = data[self.sym]
+        rsi, price = df["rsi"].iloc[i], df["close"].iloc[i]
+        if rsi < self.oversold:
+            return self.trade_to_target(1, price, portfolio, f"RSI<{self.oversold} 買進")
+        if rsi > self.overbought:
+            return self.trade_to_target(-1 if self.allow_short else 0, price, portfolio,
+                                        f"RSI>{self.overbought} 出場")
+        return []
+
+
+class BollingerStrategy(Strategy):
+    """布林通道（均值回歸）：跌破下軌做多、突破上軌出場（期貨可反手做空）。"""
+
+    def __init__(self, instrument, period: int = 20, k: float = 2.0, **kw):
+        super().__init__(instrument, **kw)
+        self.period, self.k = period, k
+
+    def prepare(self, data):
+        df = data[self.sym]
+        ma = df["close"].rolling(self.period).mean()
+        sd = df["close"].rolling(self.period).std()
+        df["bb_up"] = ma + self.k * sd
+        df["bb_dn"] = ma - self.k * sd
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.period:
+            return []
+        df = data[self.sym]
+        close, up, dn = df["close"].iloc[i], df["bb_up"].iloc[i], df["bb_dn"].iloc[i]
+        if close < dn:
+            return self.trade_to_target(1, close, portfolio, "跌破下軌買進")
+        if close > up:
+            return self.trade_to_target(-1 if self.allow_short else 0, close, portfolio, "突破上軌出場")
+        return []
+
+
+class MACDStrategy(Strategy):
+    """MACD（趨勢動能）：MACD 在訊號線之上做多，之下空手/做空。"""
+
+    def __init__(self, instrument, fast: int = 12, slow: int = 26, signal: int = 9, **kw):
+        super().__init__(instrument, **kw)
+        self.fast, self.slow, self.signal = fast, slow, signal
+
+    def prepare(self, data):
+        df = data[self.sym]
+        ema_f = df["close"].ewm(span=self.fast, adjust=False).mean()
+        ema_s = df["close"].ewm(span=self.slow, adjust=False).mean()
+        macd = ema_f - ema_s
+        df["macd"] = macd
+        df["macd_sig"] = macd.ewm(span=self.signal, adjust=False).mean()
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.slow + self.signal:
+            return []
+        df = data[self.sym]
+        macd, sig, price = df["macd"].iloc[i], df["macd_sig"].iloc[i], df["close"].iloc[i]
+        target = 1 if macd > sig else (-1 if self.allow_short else 0)
+        return self.trade_to_target(target, price, portfolio, "MACD")
+
+
+class KDStrategy(Strategy):
+    """KD 隨機指標：K 在 D 之上做多，之下空手/做空。"""
+
+    def __init__(self, instrument, period: int = 9, **kw):
+        super().__init__(instrument, **kw)
+        self.period = period
+
+    def prepare(self, data):
+        df = data[self.sym]
+        low_n = df["low"].rolling(self.period).min()
+        high_n = df["high"].rolling(self.period).max()
+        rsv = ((df["close"] - low_n) / (high_n - low_n).replace(0, np.nan) * 100).fillna(50)
+        k = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d = k.ewm(alpha=1/3, adjust=False).mean()
+        df["kd_k"], df["kd_d"] = k, d
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None or i < self.period:
+            return []
+        df = data[self.sym]
+        k, d, price = df["kd_k"].iloc[i], df["kd_d"].iloc[i], df["close"].iloc[i]
+        target = 1 if k > d else (-1 if self.allow_short else 0)
+        return self.trade_to_target(target, price, portfolio, "KD")
+
+
+class BuyHoldStrategy(Strategy):
+    """買進持有：第一根就買滿並抱到底，作為比較基準。"""
+
+    def on_bar(self, ts, data, idx, portfolio):
+        i = idx.get(self.sym)
+        if i is None:
+            return []
+        price = data[self.sym]["close"].iloc[i]
+        return self.trade_to_target(1, price, portfolio, "買進持有")
+
+
+# 名稱 -> 類別，供 UI 使用
+STRATEGY_REGISTRY = {
+    "均線交叉": MACrossStrategy,
+    "通道突破": FuturesBreakoutStrategy,
+    "RSI 超買超賣": RSIStrategy,
+    "布林通道": BollingerStrategy,
+    "MACD": MACDStrategy,
+    "KD 隨機指標": KDStrategy,
+    "買進持有": BuyHoldStrategy,
+}
 
 # --- backtester/metrics.py ---
 from typing import Dict
@@ -708,51 +847,49 @@ import pandas as pd
 import streamlit as st
 
 
-# ---------- 核心邏輯 (與 UI 分離，方便測試) ----------
+# ---------- 常用標的 ----------
+COMMON = {
+    "stock": [("台積電 2330", "2330"), ("鴻海 2317", "2317"), ("聯發科 2454", "2454"),
+              ("台達電 2308", "2308"), ("中華電 2412", "2412"), ("長榮 2603", "2603"),
+              ("元大台灣50 0050", "0050"), ("元大高股息 0056", "0056")],
+    "future": [("台指期 大台 TX", "TX"), ("小型台指 MTX", "MTX")],
+}
 
+
+# ---------- 核心邏輯 (與 UI 分離) ----------
 @st.cache_data(show_spinner=False)
-def load_data(source: str, symbol: str, asset: str, start: str, end: str,
-              token: str, syn_periods: int, syn_s0: float, syn_sigma: float) -> pd.DataFrame:
-    """抓資料並回傳標準 OHLCV。用 cache 避免重複下載/消耗 API 額度。"""
+def load_data(source, symbol, asset, start, end, token, syn_periods, syn_s0, syn_sigma):
     if source == "FinMind":
         return FinMindFeed(token=token or None).get(symbol, start=start, end=end, asset=asset)
     if source == "yfinance":
         return YFinanceFeed().get(symbol, start=start, end=end)
-    # 模擬
     s0 = syn_s0 if asset == "future" else min(syn_s0, 1000)
     return SyntheticFeed(seed=7).get("SIM", periods=syn_periods, s0=s0, sigma=syn_sigma)
 
 
-def build_instrument(cfg: dict) -> Instrument:
+def build_instrument(cfg):
     if cfg["asset"] == "future":
-        return (mtx_future(cfg["symbol"]) if cfg["fut_kind"] == "小台 MTX"
-                else tx_future(cfg["symbol"]))
+        return mtx_future(cfg["symbol"]) if cfg["symbol"] == "MTX" else tx_future(cfg["symbol"])
     return tw_stock(cfg["symbol"], fee_discount=cfg["fee_discount"])
 
 
-def build_strategy(inst: Instrument, cfg: dict) -> Strategy:
-    if cfg["strategy"] == "均線交叉":
-        return MACrossStrategy(inst, fast=cfg["fast"], slow=cfg["slow"],
-                                  lot_size=cfg["lot_size"], size_pct=cfg["size_pct"])
-    return FuturesBreakoutStrategy(inst, lookback=cfg["lookback"], contracts=cfg["contracts"])
+def build_strategy(inst, cfg):
+    kw = dict(lot_size=cfg["lot_size"], size_pct=cfg["size_pct"], contracts=cfg["contracts"])
+    cls = STRATEGY_REGISTRY[cfg["strategy"]]
+    return cls(inst, **cfg["params"], **kw)
 
 
-def run_backtest(df: pd.DataFrame, cfg: dict):
-    """回傳 (metrics, equity_df, trades_df)。純函式，無 Streamlit 相依。"""
-    inst = build_instrument(cfg)
-    strat = build_strategy(inst, cfg)
-    broker = Broker(slippage=cfg["slippage"])
-    eng = Backtest([strat], {inst.symbol: df}, initial_cash=cfg["cash"], broker=broker)
-    metrics = eng.run()
-    return metrics, eng.equity_curve(), eng.trades()
+def run_engine(df, inst, strat, cfg):
+    eng = Backtest([strat], {inst.symbol: df}, initial_cash=cfg["cash"],
+                      broker=Broker(slippage=cfg["slippage"]))
+    return eng.run(), eng
 
 
-def drawdown_series(equity: pd.Series) -> pd.Series:
+def drawdown_series(equity):
     return (equity / equity.cummax() - 1.0).clip(lower=-1.0)
 
 
-def secret_token() -> str:
-    """雲端部署時從 st.secrets 讀 FINMIND_TOKEN；本機無 secrets 檔則回傳空字串。"""
+def secret_token():
     try:
         return st.secrets.get("FINMIND_TOKEN", "")
     except Exception:
@@ -760,137 +897,199 @@ def secret_token() -> str:
 
 
 # ---------- UI ----------
-
 st.set_page_config(page_title="台股/台指期 回測面板", page_icon="📈", layout="wide")
+st.markdown("""<style>
+[data-testid="stMetricValue"]{font-size:1.5rem;font-weight:700;}
+[data-testid="stMetricLabel"]{opacity:.75;}
+.block-container{padding-top:2.5rem;}
+h1{font-size:1.7rem;}
+</style>""", unsafe_allow_html=True)
+
 st.title("📈 台股 / 台指期 回測")
 st.caption("選好條件 → 一鍵回測 → 看績效與走勢圖")
 
 with st.sidebar:
     st.header("⚙️ 控制面板")
-
     source = st.selectbox("資料來源", ["FinMind", "yfinance", "模擬資料"],
                           help="FinMind 免開戶免費、含真實台指期；yfinance 無台指期連續合約；模擬資料供離線測試")
     token = ""
     if source == "FinMind":
         token = st.text_input("FinMind token（選填）", type="password",
-                              help="留空為 300 次/小時；填入提升到 600 次/小時。"
-                                   "雲端部署時可改在 App 的 Secrets 設定 FINMIND_TOKEN，這裡留空即可自動帶入")
+                              help="留空 300 次/小時；填入 600 次/小時。雲端可改在 Secrets 設 FINMIND_TOKEN")
         if not token:
-            token = secret_token()   # 雲端 secrets 後備
+            token = secret_token()
 
-    asset_label = st.radio("商品類型", ["股票", "期貨"], horizontal=True)
-    asset = "future" if asset_label == "期貨" else "stock"
+    asset = "future" if st.radio("商品類型", ["股票", "期貨"], horizontal=True) == "期貨" else "stock"
 
-    fut_kind = "大台 TX"
-    if asset == "future":
-        fut_kind = st.selectbox("期貨契約", ["大台 TX", "小台 MTX"])
-        default_symbol = "MTX" if fut_kind == "小台 MTX" else "TX"
-        if source == "yfinance":
-            default_symbol = "^TWII"   # yfinance 用加權指數代理
+    opts = COMMON[asset]
+    labels = [l for l, _ in opts] + ["✏️ 自訂輸入"]
+    pick = st.selectbox("標的", labels)
+    if pick == "✏️ 自訂輸入":
+        symbol = st.text_input("輸入代碼", value="TX" if asset == "future" else "2330")
     else:
-        default_symbol = "2330.TW" if source == "yfinance" else "2330"
-
-    symbol = st.text_input("標的代碼", value=default_symbol)
+        symbol = dict(opts)[pick]
+    if source == "yfinance":
+        if asset == "future":
+            symbol = "^TWII"
+            st.caption("※ yfinance 無台指期連續合約，改用加權指數 ^TWII 代理")
+        elif "." not in symbol and not symbol.startswith("^"):
+            symbol = symbol + ".TW"
 
     c1, c2 = st.columns(2)
     start = c1.date_input("起始日期", value=pd.Timestamp("2019-01-01")).strftime("%Y-%m-%d")
     end = c2.date_input("結束日期", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
     st.divider()
-    default_strat = "通道突破" if asset == "future" else "均線交叉"
-    strategy = st.selectbox("策略", ["均線交叉", "通道突破"],
-                            index=0 if default_strat == "均線交叉" else 1)
+    names = list(STRATEGY_REGISTRY.keys())
+    default_idx = names.index("通道突破") if asset == "future" else names.index("均線交叉")
+    strategy = st.selectbox("策略", names, index=default_idx)
 
-    cfg = {"asset": asset, "fut_kind": fut_kind, "symbol": symbol, "strategy": strategy}
+    # 各策略參數
+    p = {}
     if strategy == "均線交叉":
-        cfg["fast"] = st.slider("短均線", 3, 60, 20)
-        cfg["slow"] = st.slider("長均線", 10, 240, 60)
-        cfg["lot_size"] = st.number_input("每筆股數", 1, 100000, 1000, step=1000)
-        cfg["size_pct"] = st.slider("資金投入比例", 0.1, 1.0, 0.95)
-    else:
-        cfg["lookback"] = st.slider("通道回看天數", 5, 120, 20)
-        cfg["contracts"] = st.number_input("每次口數/張數", 1, 50, 1)
+        p["fast"] = st.slider("短均線", 3, 60, 20); p["slow"] = st.slider("長均線", 10, 240, 60)
+    elif strategy == "通道突破":
+        p["lookback"] = st.slider("通道回看天數", 5, 120, 20)
+    elif strategy == "RSI 超買超賣":
+        p["period"] = st.slider("RSI 天數", 5, 30, 14)
+        p["oversold"] = st.slider("超賣門檻(買)", 10, 40, 30)
+        p["overbought"] = st.slider("超買門檻(賣)", 60, 90, 70)
+    elif strategy == "布林通道":
+        p["period"] = st.slider("均線天數", 5, 60, 20)
+        p["k"] = st.slider("標準差倍數", 1.0, 3.0, 2.0, step=0.1)
+    elif strategy == "MACD":
+        p["fast"] = st.slider("快線 EMA", 5, 20, 12); p["slow"] = st.slider("慢線 EMA", 20, 40, 26)
+        p["signal"] = st.slider("訊號線", 5, 15, 9)
+    elif strategy == "KD 隨機指標":
+        p["period"] = st.slider("KD 天數", 5, 30, 9)
+    elif strategy == "買進持有":
+        st.caption("買進後抱到底，作為比較基準。")
 
     st.divider()
+    cfg = {"asset": asset, "symbol": symbol, "strategy": strategy, "params": p}
+    if asset == "future":
+        cfg["contracts"] = st.number_input("交易口數", 1, 50, 1)
+        cfg["lot_size"], cfg["size_pct"] = 1000, 0.95
+    else:
+        cfg["lot_size"] = st.number_input("每筆股數", 1, 100000, 1000, step=1000)
+        cfg["size_pct"] = st.slider("資金投入比例", 0.1, 1.0, 0.95); cfg["contracts"] = 1
+
     cfg["cash"] = st.number_input("初始資金 (NT$)", 100000, 100000000, 1000000, step=100000)
     with st.expander("交易成本 / 進階"):
         cfg["slippage"] = st.slider("滑價 (比例)", 0.0, 0.005, 0.0005, step=0.0001, format="%.4f")
-        cfg["fee_discount"] = st.slider("股票手續費折數", 0.1, 1.0, 0.6,
-                                        help="例如 0.6 = 6 折；期貨不適用")
-
-    # 模擬資料參數
-    cfg["syn_periods"] = 1000
-    cfg["syn_s0"] = 18000.0 if asset == "future" else 600.0
+        cfg["fee_discount"] = st.slider("股票手續費折數", 0.1, 1.0, 0.6, help="期貨不適用")
+    cfg["syn_periods"], cfg["syn_s0"] = 1000, (18000.0 if asset == "future" else 600.0)
     cfg["syn_sigma"] = 0.18 if asset == "future" else 0.28
 
     run = st.button("🚀 執行回測", type="primary", use_container_width=True)
 
 
-# ---------- 執行與結果 ----------
-
+# ---------- 未執行：乾淨的說明頁 ----------
 if not run:
     st.subheader("三步驟開始")
     s1, s2, s3 = st.columns(3)
     s1.markdown("### 1️⃣\n**打開左側控制面板**\n\n手機請點左上角 **»**")
-    s2.markdown("### 2️⃣\n**選條件**\n\n資料來源、股票或期貨、策略")
+    s2.markdown("### 2️⃣\n**選條件**\n\n資料、股票或期貨、策略")
     s3.markdown("### 3️⃣\n**按 🚀 執行回測**\n\n馬上看到結果")
     st.divider()
-    st.markdown("結果會顯示：**總報酬、Sharpe、最大回撤、勝率**，加上**權益曲線圖**與**成交明細**。")
-    st.info("💡 新手建議：資料來源選 **FinMind**、商品選 **股票**、代碼 **2330**，直接按執行試跑一次。")
+    st.markdown("結果會分成三個分頁：**績效**（總報酬、Sharpe、回撤…）、"
+                "**走勢圖**（價格＋買賣點、與買進持有比較）、**成交明細**。")
+    st.info("💡 新手建議：資料來源選 **FinMind**、商品 **股票**、標的 **台積電 2330**，直接按執行試跑。")
     st.stop()
 
+
+# ---------- 執行 ----------
 try:
     with st.spinner("抓取資料中…"):
         df = load_data(source, symbol, asset, start, end, token,
                        cfg["syn_periods"], cfg["syn_s0"], cfg["syn_sigma"])
 except Exception as e:
-    st.error(f"資料取得失敗（{type(e).__name__}）：{e}\n\n"
-             "若在無外網環境，請改用「模擬資料」；FinMind 額度用盡可稍後再試或填 token。")
+    st.error(f"資料取得失敗（{type(e).__name__}）：{e}\n\n無外網時請改「模擬資料」；FinMind 額度用盡可稍後再試。")
     st.stop()
 
-if df is None or df.empty or len(df) < 10:
+if df is None or df.empty or len(df) < 20:
     st.warning("資料筆數不足，請調整代碼或日期區間。")
     st.stop()
 
 with st.spinner("回測運算中…"):
-    metrics, equity, trades = run_backtest(df, cfg)
+    inst = build_instrument(cfg)
+    strat = build_strategy(inst, cfg)
+    metrics, eng = run_engine(df, inst, strat, cfg)
+    # 買進持有基準（策略本身即買進持有時不重複）
+    bench = None
+    if cfg["strategy"] != "買進持有":
+        b_inst = build_instrument(cfg)
+        b_strat = BuyHoldStrategy(b_inst, lot_size=cfg["lot_size"],
+                                     size_pct=cfg["size_pct"], contracts=cfg["contracts"])
+        bench, b_eng = run_engine(df, b_inst, b_strat, cfg)
 
-src_note = f"{source}｜{symbol}｜{df.index.min().date()} ~ {df.index.max().date()}｜{len(df)} 根"
-st.success(f"完成：{src_note}")
+st.success(f"完成：{source}｜{symbol}｜{df.index.min().date()} ~ {df.index.max().date()}｜{len(df)} 根")
 
-# --- 績效指標卡 ---
+tab1, tab2, tab3 = st.tabs(["📊 績效", "📈 走勢圖", "📋 成交明細"])
+
+
 def pct(x): return f"{x*100:,.2f}%"
-m = metrics
-r1 = st.columns(4)
-r1[0].metric("總報酬率", pct(m["總報酬率"]))
-r1[1].metric("年化報酬 (CAGR)", pct(m["年化報酬(CAGR)"]))
-r1[2].metric("Sharpe", f"{m['Sharpe']:.2f}")
-r1[3].metric("最大回撤 (MDD)", pct(m["最大回撤(MDD)"]))
-r2 = st.columns(4)
-r2[0].metric("勝率", pct(m["勝率"]))
-r2[1].metric("獲利因子", f"{m['獲利因子']:.2f}")
-r2[2].metric("平倉次數", f"{int(m['平倉次數'])}")
-r2[3].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
 
-# --- 圖表 ---
-left, right = st.columns([3, 2])
-with left:
-    st.subheader("權益曲線")
-    st.line_chart(equity["equity"], height=300)
-    st.subheader("回撤")
-    st.area_chart(drawdown_series(equity["equity"]), height=180, color="#c0392b")
-with right:
-    st.subheader("摘要")
-    st.dataframe(pd.DataFrame({"指標": list(m.keys()),
-                              "數值": [f"{v}" for v in m.values()]}),
-                 hide_index=True, use_container_width=True, height=500)
+with tab1:
+    m = metrics
+    delta_ret = f"{(m['總報酬率']-bench['總報酬率'])*100:+.1f}% vs 買進持有" if bench else None
+    r1 = st.columns(4)
+    r1[0].metric("總報酬率", pct(m["總報酬率"]), delta=delta_ret)
+    r1[1].metric("年化報酬", pct(m["年化報酬(CAGR)"]))
+    r1[2].metric("Sharpe", f"{m['Sharpe']:.2f}")
+    r1[3].metric("最大回撤", pct(m["最大回撤(MDD)"]))
+    r2 = st.columns(4)
+    r2[0].metric("勝率", pct(m["勝率"]))
+    r2[1].metric("獲利因子", f"{m['獲利因子']:.2f}")
+    r2[2].metric("平倉次數", f"{int(m['平倉次數'])}")
+    r2[3].metric("是否爆倉", "是 ⚠️" if m["是否爆倉"] else "否")
+    if bench:
+        won = m["總報酬率"] > bench["總報酬率"]
+        st.markdown(f"策略總報酬 **{pct(m['總報酬率'])}**，買進持有 **{pct(bench['總報酬率'])}** — "
+                    + ("✅ 策略勝出" if won else "⚠️ 未贏過單純抱著"))
+    with st.expander("完整指標"):
+        st.dataframe(pd.DataFrame({"指標": list(m.keys()), "數值": [f"{v}" for v in m.values()]}),
+                     hide_index=True, use_container_width=True)
 
-# --- 成交明細 + 下載 ---
-st.subheader(f"成交明細（{len(trades)} 筆）")
-st.dataframe(trades, use_container_width=True, height=260)
+with tab2:
+    st.markdown("**價格與買賣點**")
+    try:
+        import altair as alt
+        pdf = df.reset_index(); pdf = pdf.rename(columns={pdf.columns[0]: "datetime"})
+        base = alt.Chart(pdf).mark_line(color="#7f8c8d").encode(
+            x=alt.X("datetime:T", title=None), y=alt.Y("close:Q", title="價格", scale=alt.Scale(zero=False)))
+        layers = [base]
+        t = eng.trades()
+        if not t.empty:
+            t = t.copy(); t["方向"] = t["qty"].apply(lambda q: "買進" if q > 0 else "賣出")
+            pts = alt.Chart(t).mark_point(size=80, filled=True, opacity=0.9).encode(
+                x="datetime:T", y="price:Q",
+                color=alt.Color("方向:N", scale=alt.Scale(domain=["買進", "賣出"], range=["#2ca02c", "#d62728"]),
+                                legend=alt.Legend(title=None)),
+                shape=alt.Shape("方向:N", scale=alt.Scale(domain=["買進", "賣出"], range=["triangle-up", "triangle-down"]),
+                                legend=None),
+                tooltip=["datetime:T", "方向:N", alt.Tooltip("price:Q", format=",.1f")])
+            layers.append(pts)
+        st.altair_chart(alt.layer(*layers).interactive(), use_container_width=True)
+    except Exception as e:
+        st.line_chart(df["close"], height=280)
+        st.caption(f"(買賣點圖略過：{type(e).__name__})")
 
-d1, d2 = st.columns(2)
-d1.download_button("⬇️ 下載權益曲線 CSV", equity.to_csv().encode("utf-8-sig"),
-                   file_name="equity_curve.csv", mime="text/csv", use_container_width=True)
-d2.download_button("⬇️ 下載成交明細 CSV", trades.to_csv(index=False).encode("utf-8-sig"),
-                   file_name="trades.csv", mime="text/csv", use_container_width=True)
+    st.markdown("**權益曲線 vs 買進持有**")
+    comp = pd.DataFrame({"策略": eng.equity_curve()["equity"]})
+    if bench is not None:
+        comp["買進持有"] = b_eng.equity_curve()["equity"]
+    st.line_chart(comp, height=280)
+
+    st.markdown("**回撤**")
+    st.area_chart(drawdown_series(eng.equity_curve()["equity"]), height=180, color="#c0392b")
+
+with tab3:
+    trades = eng.trades()
+    st.markdown(f"共 **{len(trades)}** 筆成交")
+    st.dataframe(trades, use_container_width=True, height=360)
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇️ 權益曲線 CSV", eng.equity_curve().to_csv().encode("utf-8-sig"),
+                       file_name="equity.csv", mime="text/csv", use_container_width=True)
+    d2.download_button("⬇️ 成交明細 CSV", trades.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="trades.csv", mime="text/csv", use_container_width=True)
