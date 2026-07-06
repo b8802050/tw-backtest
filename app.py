@@ -992,10 +992,203 @@ class Backtest:
     def trades(self) -> pd.DataFrame:
         return self.portfolio.trades_df()
 
+# --- backtester/config.py ---
+import os
+import copy
+
+DEFAULTS = {
+    "data": {"source": "FinMind", "asset": "stock", "symbol": "2330",
+             "timeframe": "日K", "start": "2019-01-01", "end": ""},
+    "backtest": {"cash": 1000000, "slippage": 0.0005, "fee_discount": 0.6,
+                 "size_pct": 0.95, "contracts": 1},
+    "risk": {"stop_loss": 0.0, "take_profit": 0.0, "trailing_stop": 0.0},
+    "paths": {"strategies": "strategies", "reports": "reports", "logs": "logs"},
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    cfg = copy.deepcopy(DEFAULTS)
+    try:
+        import yaml  # PyYAML 為選用；缺了就用預設
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                user = yaml.safe_load(f) or {}
+            _deep_merge(cfg, user)
+    except Exception:
+        pass
+    return cfg
+
+# --- backtester/plugins.py ---
+import os
+import glob
+import importlib.util
+
+
+
+def load_user_strategies(directory: str = "strategies") -> dict:
+    reg: dict = {}
+    if not directory or not os.path.isdir(directory):
+        return reg
+    for path in sorted(glob.glob(os.path.join(directory, "*.py"))):
+        if os.path.basename(path).startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"userstrat_{os.path.basename(path)[:-3]}", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            for obj in vars(mod).values():
+                if isinstance(obj, type) and issubclass(obj, Strategy) and obj is not Strategy:
+                    if getattr(obj, "__module__", "") != mod.__name__:
+                        continue  # 只註冊此檔定義的類別，不含 import 進來的
+                    name = getattr(obj, "DISPLAY_NAME", obj.__name__)
+                    reg[name] = obj
+        except Exception:
+            continue
+    return reg
+
+# --- backtester/report.py ---
+import os
+import html
+from datetime import datetime
+
+
+def _svg_equity(strat, bench=None, width=760, height=240, pad=28):
+    ys = list(strat)
+    if bench is not None:
+        ys = ys + list(bench)
+    if not ys:
+        return ""
+    lo, hi = min(ys), max(ys)
+    rng = (hi - lo) or 1.0
+
+    def pts(series):
+        n = len(series)
+        if n < 2:
+            return ""
+        out = []
+        for i, v in enumerate(series):
+            x = pad + (width - 2 * pad) * i / (n - 1)
+            y = height - pad - (height - 2 * pad) * (v - lo) / rng
+            out.append(f"{x:.1f},{y:.1f}")
+        return " ".join(out)
+
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" style="max-width:{width}px">']
+    parts.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="none"/>')
+    if bench is not None:
+        parts.append(f'<polyline fill="none" stroke="#94a3b8" stroke-width="1.5" points="{pts(bench)}"/>')
+    parts.append(f'<polyline fill="none" stroke="#2563eb" stroke-width="2" points="{pts(strat)}"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _fmt(k, v):
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if isinstance(v, float):
+        if any(s in k for s in ("率", "報酬", "回撤")):
+            return f"{v*100:.2f}%"
+        if any(s in k for s in ("資金", "權益", "獲利", "虧損", "期望值")):
+            return f"{v:,.0f}"
+        return f"{v:.3f}"
+    return str(v)
+
+
+def save_report(out_dir, summary: dict, metrics: dict, equity, trades=None, benchmark=None) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"report_{summary.get('symbol','x')}_{ts}"
+
+    eq = list(equity.values) if hasattr(equity, "values") else list(equity)
+    bench = (list(benchmark.values) if hasattr(benchmark, "values") else list(benchmark)) if benchmark is not None else None
+    chart = _svg_equity(eq, bench)
+
+    srows = "".join(f"<tr><td>{html.escape(str(k))}</td><td>{html.escape(str(v))}</td></tr>"
+                    for k, v in summary.items())
+    mrows = "".join(f"<tr><td>{html.escape(str(k))}</td><td>{html.escape(_fmt(k, v))}</td></tr>"
+                    for k, v in metrics.items())
+    legend = '（藍：策略；灰：買進持有）' if bench is not None else ''
+
+    doc = f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回測報告 {html.escape(summary.get('symbol',''))}</title>
+<style>
+ body{{font-family:-apple-system,"Noto Sans TC",Arial,sans-serif;max-width:820px;margin:24px auto;padding:0 16px;color:#1f2937}}
+ h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:1.6rem;border-left:4px solid #2563eb;padding-left:8px}}
+ table{{border-collapse:collapse;width:100%;font-size:.92rem}}
+ td{{border:1px solid #e5e7eb;padding:6px 10px}} td:first-child{{color:#6b7280;width:45%}}
+ .card{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin-top:10px}}
+ .muted{{color:#6b7280;font-size:.85rem}}
+</style></head><body>
+<h1>📈 回測報告</h1>
+<div class="muted">產生時間：{ts.replace('_',' ')}</div>
+<h2>執行摘要</h2><table>{srows}</table>
+<h2>權益曲線 <span class="muted">{legend}</span></h2><div class="card">{chart}</div>
+<h2>績效指標</h2><table>{mrows}</table>
+<p class="muted">※ 回測結果不代表未來績效；本報告僅供研究參考。</p>
+</body></html>"""
+
+    html_path = os.path.join(out_dir, base + ".html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    if trades is not None and hasattr(trades, "to_csv"):
+        trades.to_csv(os.path.join(out_dir, base + "_trades.csv"), index=False, encoding="utf-8-sig")
+    return html_path
+
+# --- backtester/runlog.py ---
+import os
+import logging
+from datetime import datetime
+
+
+def get_logger(log_dir: str = "logs") -> logging.Logger:
+    logger = logging.getLogger("backtester")
+    logger.setLevel(logging.INFO)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        fname = os.path.join(log_dir, f"run_{datetime.now():%Y-%m-%d}.log")
+        if not any(getattr(h, "_bt_file", None) == fname for h in logger.handlers):
+            fh = logging.FileHandler(fname, encoding="utf-8")
+            fh._bt_file = fname
+            fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+            logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+
+def log_run(summary: dict, metrics: dict, log_dir: str = "logs"):
+    try:
+        logger = get_logger(log_dir)
+        s = "｜".join(f"{k}={summary.get(k)}" for k in ("source", "symbol", "timeframe", "strategy"))
+        m = (f"報酬={metrics.get('總報酬率', 0)*100:.2f}% "
+             f"Sharpe={metrics.get('Sharpe', 0):.2f} "
+             f"MDD={metrics.get('最大回撤(MDD)', 0)*100:.2f}% "
+             f"勝率={metrics.get('勝率', 0)*100:.1f}% "
+             f"交易={int(metrics.get('平倉次數', 0))}")
+        logger.info(f"{s}｜{m}")
+    except Exception:
+        pass
+
 # --- Streamlit 介面 ---
 
 import pandas as pd
 import streamlit as st
+
+CONFIG = load_config()
+# 自動載入 strategies/ 外掛策略（缺資料夾則略過）
+try:
+    STRATEGY_REGISTRY.update(load_user_strategies(CONFIG["paths"]["strategies"]))
+except Exception:
+    pass
 
 COMMON = {
     "stock": [("台積電 2330", "2330"), ("鴻海 2317", "2317"), ("聯發科 2454", "2454"),
@@ -1190,7 +1383,9 @@ with st.sidebar:
     st.header("⚙️ 控制面板")
     mode = st.radio("模式", ["單次回測", "參數最佳化", "成本壓力測試"], horizontal=True,
                     help="單次回測=跑一組參數；參數最佳化=掃描找最佳；成本壓力測試=放大成本看策略是否還活著")
-    source = st.selectbox("資料來源", ["FinMind", "yfinance", "模擬資料"],
+    _srcs = ["FinMind", "yfinance", "模擬資料"]
+    source = st.selectbox("資料來源", _srcs,
+                          index=_srcs.index(CONFIG["data"]["source"]) if CONFIG["data"]["source"] in _srcs else 0,
                           help="FinMind 免開戶免費、含真實台指期；分鐘K需選 yfinance")
     token = ""
     if source == "FinMind":
@@ -1198,14 +1393,19 @@ with st.sidebar:
                               help="留空 300 次/小時；填入 600；雲端可用 Secrets 設 FINMIND_TOKEN")
         token = token or secret_token()
 
-    timeframe = st.selectbox("K線週期", ["日K", "週K", "月K", "60分", "30分", "15分"],
+    _tfs = ["日K", "週K", "月K", "60分", "30分", "15分"]
+    timeframe = st.selectbox("K線週期", _tfs,
+                             index=_tfs.index(CONFIG["data"]["timeframe"]) if CONFIG["data"]["timeframe"] in _tfs else 0,
                              help="日/週/月穩定；分鐘K僅 yfinance、只能取近期")
-    asset = "future" if st.radio("商品類型", ["股票", "期貨"], horizontal=True) == "期貨" else "stock"
+    _is_fut_default = CONFIG["data"]["asset"] == "future"
+    asset = "future" if st.radio("商品類型", ["股票", "期貨"], horizontal=True,
+                                 index=1 if _is_fut_default else 0) == "期貨" else "stock"
 
     opts = COMMON[asset]
     labels = [l for l, _ in opts] + ["✏️ 自訂輸入"]
     pick = st.selectbox("標的", labels)
-    symbol = st.text_input("輸入代碼", value="TX" if asset == "future" else "2330") if pick == "✏️ 自訂輸入" else dict(opts)[pick]
+    _sym_default = CONFIG["data"]["symbol"] if asset == "stock" else "TX"
+    symbol = st.text_input("輸入代碼", value=_sym_default) if pick == "✏️ 自訂輸入" else dict(opts)[pick]
 
     interval_code, resample_rule = None, None
     if timeframe in INTRADAY:
@@ -1222,8 +1422,11 @@ with st.sidebar:
             symbol = symbol + ".TW"
 
     c1, c2 = st.columns(2)
-    start = c1.date_input("起始日期", value=pd.Timestamp("2019-01-01")).strftime("%Y-%m-%d")
-    end = c2.date_input("結束日期", value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+    _start_default = pd.Timestamp(CONFIG["data"]["start"] or "2019-01-01")
+    _end_cfg = CONFIG["data"]["end"]
+    _end_default = pd.Timestamp(_end_cfg) if _end_cfg else pd.Timestamp.today()
+    start = c1.date_input("起始日期", value=_start_default).strftime("%Y-%m-%d")
+    end = c2.date_input("結束日期", value=_end_default).strftime("%Y-%m-%d")
     if interval_code:
         days = 55 if timeframe in ("15分", "30分") else 700
         ms = (pd.Timestamp.today() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
@@ -1267,21 +1470,22 @@ with st.sidebar:
             p = strategy_param_ui(cfg["strategy"])
         cfg["params"] = p
 
+    _r = CONFIG["risk"]; _b = CONFIG["backtest"]
     with st.expander("🛑 停損 / 停利 / 移動停損（選用）"):
-        sl = st.slider("停損 %", 0, 50, 0, help="跌破進場價這個 % 就出場（0=關閉）")
-        tp = st.slider("停利 %", 0, 100, 0, help="獲利達這個 % 就出場（0=關閉）")
-        tr = st.slider("移動停損 %", 0, 50, 0, help="從進場後最佳價回落這個 % 就出場（0=關閉）")
+        sl = st.slider("停損 %", 0, 50, int(_r["stop_loss"] * 100), help="跌破進場價這個 % 就出場（0=關閉）")
+        tp = st.slider("停利 %", 0, 100, int(_r["take_profit"] * 100), help="獲利達這個 % 就出場（0=關閉）")
+        tr = st.slider("移動停損 %", 0, 50, int(_r["trailing_stop"] * 100), help="從進場後最佳價回落這個 % 就出場（0=關閉）")
     cfg["stop_loss"], cfg["take_profit"], cfg["trailing_stop"] = sl/100.0, tp/100.0, tr/100.0
 
     if asset == "future":
-        cfg["contracts"] = st.number_input("交易口數", 1, 50, 1); cfg["lot_size"], cfg["size_pct"] = 1000, 0.95
+        cfg["contracts"] = st.number_input("交易口數", 1, 50, int(_b["contracts"])); cfg["lot_size"], cfg["size_pct"] = 1000, 0.95
     else:
         cfg["lot_size"] = st.number_input("每筆股數", 1, 100000, 1000, step=1000)
-        cfg["size_pct"] = st.slider("資金投入比例", 0.1, 1.0, 0.95); cfg["contracts"] = 1
-    cfg["cash"] = st.number_input("初始資金 (NT$)", 100000, 100000000, 1000000, step=100000)
+        cfg["size_pct"] = st.slider("資金投入比例", 0.1, 1.0, float(_b["size_pct"])); cfg["contracts"] = 1
+    cfg["cash"] = st.number_input("初始資金 (NT$)", 100000, 100000000, int(_b["cash"]), step=100000)
     with st.expander("交易成本 / 進階"):
-        cfg["slippage"] = st.slider("滑價 (比例)", 0.0, 0.005, 0.0005, step=0.0001, format="%.4f")
-        cfg["fee_discount"] = st.slider("股票手續費折數", 0.1, 1.0, 0.6, help="期貨不適用")
+        cfg["slippage"] = st.slider("滑價 (比例)", 0.0, 0.005, float(_b["slippage"]), step=0.0001, format="%.4f")
+        cfg["fee_discount"] = st.slider("股票手續費折數", 0.1, 1.0, float(_b["fee_discount"]), help="期貨不適用")
     cfg["syn_periods"], cfg["syn_s0"] = 1000, (18000.0 if asset == "future" else 600.0)
     cfg["syn_sigma"] = 0.18 if asset == "future" else 0.28
 
@@ -1289,7 +1493,9 @@ with st.sidebar:
                     type="primary", use_container_width=True)
 
 
-if not run:
+if run:
+    st.session_state["has_run"] = True
+if not st.session_state.get("has_run"):
     st.subheader("三步驟開始")
     cols = st.columns(3)
     steps = [("1️⃣", "打開左側控制面板", "手機請點左上角 »"),
@@ -1498,6 +1704,13 @@ with st.spinner("回測運算中…"):
                                      contracts=cfg["contracts"])
         bench, b_eng = run_engine(df, b_inst, b_strat, cfg)
 
+_summary = {"source": source, "symbol": symbol, "timeframe": timeframe, "strategy": cfg["strategy"],
+            "期間": f"{df.index.min().date()} ~ {df.index.max().date()}", "根數": len(df)}
+try:
+    log_run(_summary, metrics, CONFIG["paths"]["logs"])
+except Exception:
+    pass
+
 st.success(f"完成：{source}｜{symbol}｜{timeframe}｜{df.index.min().date()} ~ {df.index.max().date()}｜{len(df)} 根")
 tab1, tab2, tab3 = st.tabs(["📊 績效", "📈 走勢圖", "📋 成交明細"])
 
@@ -1584,3 +1797,20 @@ with tab3:
                        file_name="equity.csv", mime="text/csv", use_container_width=True)
     d2.download_button("⬇️ 成交明細 CSV", trades.to_csv(index=False).encode("utf-8-sig"),
                        file_name="trades.csv", mime="text/csv", use_container_width=True)
+
+    st.divider()
+    if st.button("💾 產生 HTML 報告", use_container_width=True,
+                 help="輸出一份含指標與權益圖的報告，存到 reports/ 並可下載"):
+        try:
+            eqc = eng.equity_curve()["equity"]
+            bch = b_eng.equity_curve()["equity"] if bench is not None else None
+            rpt_summary = dict(_summary); rpt_summary["策略參數"] = str(cfg.get("params", {}))
+            path = save_report(CONFIG["paths"]["reports"], rpt_summary, metrics, eqc, trades, bch)
+            with open(path, "rb") as f:
+                html_bytes = f.read()
+            st.success(f"報告已產生：{os.path.basename(path)}（存於 {CONFIG['paths']['reports']}/）")
+            st.download_button("⬇️ 下載 HTML 報告", html_bytes,
+                               file_name=os.path.basename(path), mime="text/html",
+                               use_container_width=True)
+        except Exception as e:
+            st.error(f"產生報告失敗：{type(e).__name__}：{e}")
