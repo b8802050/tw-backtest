@@ -1110,6 +1110,24 @@ def walk_forward(df, cfg, grid, objective, n_folds=4):
     return pd.DataFrame(rows)
 
 
+def cost_stress(df, cfg, mults):
+    """把手續費與滑價同時放大 k 倍（稅為法定固定成本，不放大），看策略是否還活著。"""
+    rows = []
+    for k in mults:
+        inst = build_instrument(cfg)
+        inst.commission_rate *= k
+        inst.commission_per_contract *= k
+        inst.min_commission *= k
+        strat = build_strategy(inst, cfg)
+        eng = Backtest([strat], {inst.symbol: df}, initial_cash=cfg["cash"],
+                          broker=Broker(slippage=cfg["slippage"] * k))
+        m = eng.run()
+        rows.append({"成本倍數": k, "總報酬率": m["總報酬率"], "年化報酬": m["年化報酬(CAGR)"],
+                     "Sharpe": m["Sharpe"], "最大回撤": m["最大回撤(MDD)"], "勝率": m["勝率"],
+                     "獲利因子": m["獲利因子"], "平倉次數": int(m["平倉次數"])})
+    return pd.DataFrame(rows)
+
+
 def drawdown_series(equity):
     return (equity / equity.cummax() - 1.0).clip(lower=-1.0)
 
@@ -1170,8 +1188,8 @@ st.caption("選好條件 → 一鍵回測 → 看績效與走勢圖")
 
 with st.sidebar:
     st.header("⚙️ 控制面板")
-    mode = st.radio("模式", ["單次回測", "參數最佳化"], horizontal=True,
-                    help="單次回測=跑一組參數；參數最佳化=自動掃描多組參數找最佳")
+    mode = st.radio("模式", ["單次回測", "參數最佳化", "成本壓力測試"], horizontal=True,
+                    help="單次回測=跑一組參數；參數最佳化=掃描找最佳；成本壓力測試=放大成本看策略是否還活著")
     source = st.selectbox("資料來源", ["FinMind", "yfinance", "模擬資料"],
                           help="FinMind 免開戶免費、含真實台指期；分鐘K需選 yfinance")
     token = ""
@@ -1267,7 +1285,7 @@ with st.sidebar:
     cfg["syn_periods"], cfg["syn_s0"] = 1000, (18000.0 if asset == "future" else 600.0)
     cfg["syn_sigma"] = 0.18 if asset == "future" else 0.28
 
-    run = st.button("🔧 開始最佳化" if mode == "參數最佳化" else "🚀 執行回測",
+    run = st.button({"參數最佳化": "🔧 開始最佳化", "成本壓力測試": "🧪 開始壓力測試"}.get(mode, "🚀 執行回測"),
                     type="primary", use_container_width=True)
 
 
@@ -1281,13 +1299,16 @@ if not run:
         with col.container(border=True):
             st.markdown(f"### {n}"); st.markdown(f"**{t}**"); st.caption(d)
     st.markdown("")
-    a, b = st.columns(2)
+    a, b, cc = st.columns(3)
     with a.container(border=True):
         st.markdown("**📊 單次回測**")
         st.caption("績效卡＋走勢圖(買賣點、與買進持有比較)＋成交明細")
     with b.container(border=True):
         st.markdown("**🔧 參數最佳化**")
-        st.caption("自動掃描多組參數，含樣本外驗證，依目標(含勝率)排序找最佳")
+        st.caption("掃描多組參數，含樣本外/Walk-forward 驗證，依目標(含勝率)排序")
+    with cc.container(border=True):
+        st.markdown("**🧪 成本壓力測試**")
+        st.caption("放大手續費與滑價 1×→5×，看策略是否只在低成本下才賺錢")
     st.info("💡 新手建議：資料 **FinMind**、週期 **日K**、商品 **股票**、標的 **台積電 2330**。")
     st.stop()
 
@@ -1402,6 +1423,66 @@ if mode == "參數最佳化":
                        file_name="optimize.csv", mime="text/csv")
     st.warning("⚠️ 別只追高勝率或樣本內冠軍：勝率高不代表賺錢（看**獲利因子/賺賠比**），"
                "且樣本內最好常在樣本外變差。更嚴謹請改用上方「Walk-forward 滾動驗證」。")
+    st.stop()
+
+
+# ---------- 成本壓力測試 ----------
+if mode == "成本壓力測試":
+    mults = [1.0, 1.5, 2.0, 3.0, 5.0]
+    with st.spinner("放大成本測試中…"):
+        sdf = cost_stress(df, cfg, mults)
+    base = sdf.iloc[0]
+    st.success(f"完成：{cfg['strategy']}｜{symbol}｜{timeframe}｜成本 1×→5× 壓力測試")
+
+    if base["總報酬率"] <= 0:
+        verdict = "⚠️ 連正常成本（1×）都是虧的，這個策略在此標的無效。"
+    else:
+        died = sdf[sdf["總報酬率"] <= 0]
+        if died.empty:
+            verdict = "✅ 即使成本放大到 5×，報酬仍為正 → 相對穩健（成本不是它賺錢的關鍵假設）。"
+        else:
+            kd = died.iloc[0]["成本倍數"]
+            r2 = sdf[sdf["成本倍數"] == 2.0]["總報酬率"]
+            tag = "尚可" if (not r2.empty and r2.iloc[0] > base["總報酬率"] * 0.5) else "脆弱"
+            verdict = f"⚠️ 成本放大到 {kd:g}× 就由賺轉賠 → 穩健度{tag}；獲利高度依賴低成本假設，實盤要非常小心。"
+    st.markdown(f"**判定**：{verdict}")
+
+    c = st.columns(3)
+    c[0].metric("1× 總報酬率", pct(base["總報酬率"]))
+    r2row = sdf[sdf["成本倍數"] == 2.0]["總報酬率"]
+    r3row = sdf[sdf["成本倍數"] == 3.0]["總報酬率"]
+    c[1].metric("2× 總報酬率", pct(r2row.iloc[0]) if not r2row.empty else "-",
+                delta=f"{(r2row.iloc[0]-base['總報酬率'])*100:+.1f}%" if not r2row.empty else None)
+    c[2].metric("3× 總報酬率", pct(r3row.iloc[0]) if not r3row.empty else "-",
+                delta=f"{(r3row.iloc[0]-base['總報酬率'])*100:+.1f}%" if not r3row.empty else None)
+
+    try:
+        import altair as alt
+        ch = sdf.copy(); ch["倍數"] = ch["成本倍數"].map(lambda k: f"{k:g}×")
+        ch["正負"] = ch["總報酬率"].map(lambda v: "正" if v > 0 else "負")
+        st.markdown("#### 總報酬率 vs 成本倍數")
+        st.altair_chart(alt.Chart(ch).mark_bar().encode(
+            x=alt.X("倍數:N", sort=list(ch["倍數"]), title="手續費＋滑價倍數"),
+            y=alt.Y("總報酬率:Q", axis=alt.Axis(format="%"), title="總報酬率"),
+            color=alt.Color("正負:N", scale=alt.Scale(domain=["正", "負"], range=["#16a34a", "#dc2626"]),
+                            legend=None),
+            tooltip=[alt.Tooltip("倍數:N"), alt.Tooltip("總報酬率:Q", format=".2%")]),
+            use_container_width=True)
+    except Exception:
+        pass
+
+    disp = sdf.copy()
+    disp["成本倍數"] = disp["成本倍數"].map(lambda k: f"{k:g}×")
+    for col in ["總報酬率", "年化報酬", "最大回撤", "勝率"]:
+        disp[col] = (sdf[col] * 100).round(2).astype(str) + "%"
+    disp["Sharpe"] = disp["Sharpe"].round(2); disp["獲利因子"] = disp["獲利因子"].round(2)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.download_button("⬇️ 壓力測試結果 CSV", sdf.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="cost_stress.csv", mime="text/csv")
+    st.warning("⚠️ 放大的是**手續費與滑價**（執行面的不確定性）；證交稅/期交稅為法定固定成本，未放大。"
+               "真實滑價在大單、小型股、跳空、流動性差時可能遠超這裡的倍數。")
+    st.info("💡 用法：值得繼續研究的策略，通常在 2× 成本下仍應保有正報酬；撐不過 2× 的多半是假訊號或成本邊際策略。")
     st.stop()
 
 
